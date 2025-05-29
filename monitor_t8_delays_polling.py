@@ -124,7 +124,13 @@ async def process_tweet(tweet):
         
         text = tweet.text.lower()
         t8_keywords = ['t8', 'airport']
-        delay_keywords = ['delay', 'disruption', 'cancelled', 'issue', 'suspended', 'stopped', 'problem']
+        delay_keywords = [
+            'delay', 'disruption', 'cancelled', 'issue', 'suspended', 'stopped', 'problem',
+            'extra travel time', 'allow extra', 'not running', 'service alert', 'altered',
+            'incident', 'emergency', 'flooding', 'power supply', 'signal repairs', 
+            'shuttle', 'reduced service', 'timetable order', 'longer journey', 'wait times',
+            'repairs', 'urgent', 'limited', 'diverted', 'gaps', 'less frequent', 'late'
+        ]
         
         has_t8_content = any(keyword in text for keyword in t8_keywords)
         has_delay_content = any(keyword in text for keyword in delay_keywords)
