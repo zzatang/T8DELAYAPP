@@ -123,7 +123,8 @@ async def process_tweet(tweet):
             return False
         
         text = tweet.text.lower()
-        t8_keywords = ['t8', 'airport']
+        # Remove T8/Airport keywords requirement since we're monitoring @T8SydneyTrains
+        # All tweets from this account are T8-related by default
         delay_keywords = [
             'delay', 'disruption', 'cancelled', 'issue', 'suspended', 'stopped', 'problem',
             'extra travel time', 'allow extra', 'not running', 'service alert', 'altered',
@@ -132,10 +133,10 @@ async def process_tweet(tweet):
             'repairs', 'urgent', 'limited', 'diverted', 'gaps', 'less frequent', 'late'
         ]
         
-        has_t8_content = any(keyword in text for keyword in t8_keywords)
+        # Only check for delay keywords since we're already monitoring T8 account
         has_delay_content = any(keyword in text for keyword in delay_keywords)
         
-        if has_t8_content and has_delay_content:
+        if has_delay_content:
             tweet_time = tweet.created_at.astimezone(dateutil.tz.gettz('Australia/Sydney'))
             message = (
                 f'🚆 T8 Airport Line Alert:\n\n'
