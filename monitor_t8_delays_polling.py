@@ -118,8 +118,17 @@ def save_last_tweet_id(tweet_id):
 async def process_tweet(tweet):
     try:
         now = datetime.now(dateutil.tz.gettz('Australia/Sydney'))
+        tweet_time = tweet.created_at.astimezone(dateutil.tz.gettz('Australia/Sydney'))
+        
+        # Check if current time is within monitoring window
         if not (is_sydney_school_day(now) and is_within_time_window(now)):
             logger.debug(f'Outside monitoring window, skipping tweet: {tweet.text[:50]}...')
+            return False
+        
+        # Check if tweet was posted within 2 hours of current check time
+        time_diff = now - tweet_time
+        if time_diff > timedelta(hours=2):
+            logger.debug(f'Tweet too old ({time_diff}), skipping: {tweet.text[:50]}...')
             return False
         
         text = tweet.text.lower()
@@ -137,15 +146,15 @@ async def process_tweet(tweet):
         has_delay_content = any(keyword in text for keyword in delay_keywords)
         
         if has_delay_content:
-            tweet_time = tweet.created_at.astimezone(dateutil.tz.gettz('Australia/Sydney'))
             message = (
                 f'🚆 T8 Airport Line Alert:\n\n'
                 f'{tweet.text}\n\n'
                 f'📅 Tweet: {tweet_time.strftime("%Y-%m-%d %H:%M:%S AEST")}\n'
-                f'⏰ Alert: {now.strftime("%Y-%m-%d %H:%M:%S AEST")}'
+                f'⏰ Alert: {now.strftime("%Y-%m-%d %H:%M:%S AEST")}\n'
+                f'⏱️ Age: {str(time_diff).split(".")[0]} ago'
             )
             await telegram_bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=message)
-            logger.info(f'Telegram notification sent for tweet: {tweet.text[:100]}...')
+            logger.info(f'Telegram notification sent for tweet ({time_diff} old): {tweet.text[:100]}...')
             return True
         else:
             logger.debug(f'Tweet does not match criteria: {tweet.text[:50]}...')
