@@ -5,6 +5,7 @@ import os
 from datetime import datetime, timedelta
 from telegram import Bot
 import dateutil.tz
+import ollama
 
 # Load environment variables from .env file if it exists
 def load_env_file():
@@ -36,6 +37,10 @@ X_BEARER_TOKEN = os.getenv('X_BEARER_TOKEN')
 TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
 TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
 
+# Ollama configuration
+OLLAMA_MODEL = os.getenv('OLLAMA_MODEL', 'llama3.2:3b')  # Default to 3b model
+OLLAMA_HOST = os.getenv('OLLAMA_HOST', 'http://localhost:11434')  # Default Ollama port
+
 # Polling interval configuration (in minutes)
 # Default: 60 minutes to stay within 100 API calls per month
 # For 100 calls/month: 60 minutes = ~95 calls/month
@@ -52,6 +57,9 @@ if missing_vars:
     exit(1)
 
 telegram_bot = Bot(token=TELEGRAM_BOT_TOKEN)
+
+# Configure Ollama client for local Docker instance
+ollama_client = ollama.Client(host=OLLAMA_HOST)
 
 # Log polling configuration
 logger.info(f'📊 Polling interval: {POLLING_INTERVAL_MINUTES} minutes ({POLLING_INTERVAL_SECONDS} seconds)')
@@ -115,6 +123,156 @@ def save_last_tweet_id(tweet_id):
     except Exception as e:
         logger.warning(f'Error saving last tweet ID: {e}')
 
+async def analyze_tweet_with_ollama(tweet_text):
+    """
+    Use local Ollama LLM to analyze if a tweet indicates service disruption
+    Returns: (should_alert: bool, confidence: str, reasoning: str)
+    """
+    try:
+        prompt = f"""You are analyzing a tweet from T8 Sydney Trains to determine if passengers should be alerted about service disruptions.
+
+Tweet: "{tweet_text}"
+
+Analyze this tweet and determine if it indicates:
+- Service delays, disruptions, or cancellations
+- Track/signal/power issues affecting services  
+- Reduced services or altered timetables
+- Emergency situations affecting trains
+- Platform changes or shuttle bus replacements
+- Any situation requiring "extra travel time"
+
+ALERT-WORTHY examples:
+- "Allow extra travel time due to..."
+- "Services suspended/cancelled/delayed"
+- "Trains not running between..."
+- "Reduced service due to..."
+- "Platform changes" 
+- "Shuttle buses replacing trains"
+
+NOT alert-worthy:
+- "Services restored to normal"
+- General information without service impact
+- Routine announcements
+
+Respond EXACTLY in this format:
+ALERT: YES or NO
+CONFIDENCE: HIGH or MEDIUM or LOW  
+REASONING: Brief explanation"""
+
+        # Log the tweet being analyzed
+        logger.info(f'🔍 OLLAMA ANALYSIS START')
+        logger.info(f'📝 Tweet Text: "{tweet_text}"')
+        logger.info(f'🤖 Model: {OLLAMA_MODEL}')
+        
+        # Call local Ollama instance
+        response = ollama_client.chat(
+            model=OLLAMA_MODEL,
+            messages=[
+                {
+                    'role': 'system', 
+                    'content': 'You are an expert at analyzing public transport service announcements. Be concise and accurate.'
+                },
+                {
+                    'role': 'user', 
+                    'content': prompt
+                }
+            ],
+            options={
+                'temperature': 0.1,  # Low temperature for consistent responses
+                'top_p': 0.9,
+                'num_predict': 150   # Limit response length
+            }
+        )
+        
+        analysis = response['message']['content'].strip()
+        
+        # Log the raw AI response
+        logger.info(f'🤖 OLLAMA RAW RESPONSE:')
+        logger.info(f'"{analysis}"')
+        
+        # Parse the structured response
+        alert = "NO"
+        confidence = "LOW"
+        reasoning = "Unable to parse AI response"
+        
+        lines = analysis.split('\n')
+        for line in lines:
+            line = line.strip()
+            if line.startswith('ALERT:'):
+                alert = line.split(':', 1)[1].strip().upper()
+            elif line.startswith('CONFIDENCE:'):
+                confidence = line.split(':', 1)[1].strip().upper()
+            elif line.startswith('REASONING:'):
+                reasoning = line.split(':', 1)[1].strip()
+        
+        should_alert = alert == "YES"
+        
+        # Log the parsed results
+        logger.info(f'📊 OLLAMA PARSED RESULTS:')
+        logger.info(f'   Alert Decision: {alert}')
+        logger.info(f'   Confidence Level: {confidence}')
+        logger.info(f'   Reasoning: {reasoning}')
+        logger.info(f'   Will Send Telegram Alert: {should_alert}')
+        logger.info(f'🔍 OLLAMA ANALYSIS END')
+        logger.info(f'{"="*60}')
+        
+        return should_alert, confidence, reasoning
+        
+    except Exception as e:
+        logger.error(f'❌ OLLAMA ANALYSIS ERROR: {e}')
+        logger.info('🔄 Falling back to keyword analysis')
+        logger.info(f'{"="*60}')
+        return await fallback_keyword_analysis(tweet_text)
+
+async def fallback_keyword_analysis(tweet_text):
+    """Fallback keyword analysis if Ollama fails"""
+    try:
+        text = tweet_text.lower()
+        delay_keywords = [
+            'delay', 'disruption', 'cancelled', 'issue', 'suspended', 'stopped', 'problem',
+            'extra travel time', 'allow extra', 'not running', 'service alert', 'altered',
+            'incident', 'emergency', 'flooding', 'power supply', 'signal repairs', 
+            'shuttle', 'reduced service', 'timetable order', 'longer journey', 'wait times',
+            'repairs', 'urgent', 'limited', 'diverted', 'gaps', 'less frequent', 'late'
+        ]
+        
+        has_delay_content = any(keyword in text for keyword in delay_keywords)
+        found_keywords = [k for k in delay_keywords if k in text]
+        reasoning = f"Keyword fallback - Found: {found_keywords}" if found_keywords else "No delay keywords found"
+        
+        # Log fallback analysis
+        logger.info(f'🔄 FALLBACK KEYWORD ANALYSIS:')
+        logger.info(f'📝 Tweet Text: "{tweet_text}"')
+        logger.info(f'🔍 Keywords Found: {found_keywords}')
+        logger.info(f'📊 Alert Decision: {"YES" if has_delay_content else "NO"}')
+        logger.info(f'💭 Reasoning: {reasoning}')
+        logger.info(f'🔄 FALLBACK ANALYSIS END')
+        logger.info(f'{"="*60}')
+        
+        return has_delay_content, "MEDIUM", reasoning
+    except Exception as e:
+        logger.error(f'❌ Error in fallback analysis: {e}')
+        return False, "LOW", "Analysis failed"
+
+async def test_ollama_connection():
+    """Test connection to local Ollama instance"""
+    try:
+        # Test with a simple prompt
+        response = ollama_client.chat(
+            model=OLLAMA_MODEL,
+            messages=[{'role': 'user', 'content': 'Say "Ollama connected" if you can read this.'}],
+            options={'num_predict': 10}
+        )
+        
+        result = response['message']['content'].strip()
+        logger.info(f'🤖 Ollama connection test successful: {result}')
+        return True
+        
+    except Exception as e:
+        logger.error(f'❌ Ollama connection test failed: {e}')
+        logger.info('Will fall back to keyword analysis if needed')
+        return False
+
 async def process_tweet(tweet):
     try:
         now = datetime.now(dateutil.tz.gettz('Australia/Sydney'))
@@ -131,33 +289,30 @@ async def process_tweet(tweet):
             logger.debug(f'Tweet too old ({time_diff}), skipping: {tweet.text[:50]}...')
             return False
         
-        text = tweet.text.lower()
-        # Remove T8/Airport keywords requirement since we're monitoring @T8SydneyTrains
-        # All tweets from this account are T8-related by default
-        delay_keywords = [
-            'delay', 'disruption', 'cancelled', 'issue', 'suspended', 'stopped', 'problem',
-            'extra travel time', 'allow extra', 'not running', 'service alert', 'altered',
-            'incident', 'emergency', 'flooding', 'power supply', 'signal repairs', 
-            'shuttle', 'reduced service', 'timetable order', 'longer journey', 'wait times',
-            'repairs', 'urgent', 'limited', 'diverted', 'gaps', 'less frequent', 'late'
-        ]
+        # Log tweet processing start
+        logger.info(f'🚆 PROCESSING TWEET:')
+        logger.info(f'📅 Tweet Time: {tweet_time.strftime("%Y-%m-%d %H:%M:%S AEST")}')
+        logger.info(f'⏰ Current Time: {now.strftime("%Y-%m-%d %H:%M:%S AEST")}')
+        logger.info(f'⏱️ Tweet Age: {str(time_diff).split(".")[0]}')
         
-        # Only check for delay keywords since we're already monitoring T8 account
-        has_delay_content = any(keyword in text for keyword in delay_keywords)
+        # Use Ollama AI to analyze the tweet
+        should_alert, confidence, reasoning = await analyze_tweet_with_ollama(tweet.text)
         
-        if has_delay_content:
+        if should_alert:
             message = (
                 f'🚆 T8 Airport Line Alert:\n\n'
                 f'{tweet.text}\n\n'
                 f'📅 Tweet: {tweet_time.strftime("%Y-%m-%d %H:%M:%S AEST")}\n'
                 f'⏰ Alert: {now.strftime("%Y-%m-%d %H:%M:%S AEST")}\n'
-                f'⏱️ Age: {str(time_diff).split(".")[0]} ago'
+                f'⏱️ Age: {str(time_diff).split(".")[0]} ago\n'
+                f'🤖 AI Confidence: {confidence}\n'
+                f'💭 Reasoning: {reasoning}'
             )
             await telegram_bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=message)
-            logger.info(f'Telegram notification sent for tweet ({time_diff} old): {tweet.text[:100]}...')
+            logger.info(f'✅ TELEGRAM ALERT SENT ({confidence} confidence)')
             return True
         else:
-            logger.debug(f'Tweet does not match criteria: {tweet.text[:50]}...')
+            logger.info(f'❌ NO TELEGRAM ALERT SENT ({confidence} confidence)')
             return False
     except Exception as e:
         logger.error(f'Error processing tweet: {e}')
@@ -260,7 +415,7 @@ async def send_critical_error_alert(error_message):
         logger.error(f"Failed to send critical error alert: {e}")
 
 async def main():
-    logger.info('Starting T8 Delays Monitor (Quota-Optimized Polling Mode)...')
+    logger.info('Starting T8 Delays Monitor with Ollama AI Analysis...')
     
     if not await test_telegram_connection():
         logger.error('Failed to connect to Telegram. Exiting.')
@@ -270,7 +425,11 @@ async def main():
         logger.error('Failed to connect to Twitter API. Exiting.')
         return
     
-    logger.info('All connections successful. Starting monitoring...')
+    # Test Ollama connection (non-blocking)
+    await test_ollama_connection()
+    
+    logger.info('All connections tested. Starting monitoring...')
+    logger.info(f'🤖 Using Ollama model: {OLLAMA_MODEL} at {OLLAMA_HOST}')
     logger.info(f'Monitoring mode: Polling every {POLLING_INTERVAL_MINUTES} minutes during school days and peak hours')
     
     heartbeat_counter = 0
