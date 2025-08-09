@@ -153,6 +153,8 @@ NOT alert-worthy:
 - "Services restored to normal"
 - General information without service impact
 - Routine announcements
+- Announcements about future trackwork
+- Future changes to services
 
 Respond EXACTLY in this format:
 ALERT: YES or NO
