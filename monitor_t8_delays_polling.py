@@ -6,6 +6,7 @@ from datetime import datetime, timedelta
 from telegram import Bot
 import dateutil.tz
 import ollama
+import aiohttp
 
 # Load environment variables from .env file if it exists
 def load_env_file():
@@ -37,6 +38,10 @@ X_BEARER_TOKEN = os.getenv('X_BEARER_TOKEN')
 TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
 TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
 
+# TwitterAPI.io configuration
+TWITTERAPI_IO_KEY = os.getenv('TWITTERAPI_IO_KEY')
+USE_TWITTERAPI_IO = os.getenv('USE_TWITTERAPI_IO', 'false').lower() == 'true'
+
 # Ollama configuration
 OLLAMA_MODEL = os.getenv('OLLAMA_MODEL', 'llama3.2:3b')  # Default to 3b model
 OLLAMA_HOST = os.getenv('OLLAMA_HOST', 'http://localhost:11434')  # Default Ollama port
@@ -49,11 +54,18 @@ OLLAMA_HOST = os.getenv('OLLAMA_HOST', 'http://localhost:11434')  # Default Olla
 POLLING_INTERVAL_MINUTES = int(os.getenv('POLLING_INTERVAL_MINUTES', '60'))
 POLLING_INTERVAL_SECONDS = POLLING_INTERVAL_MINUTES * 60
 
-required_vars = ['X_BEARER_TOKEN', 'TELEGRAM_BOT_TOKEN', 'TELEGRAM_CHAT_ID']
+# Validate required environment variables based on API choice
+if USE_TWITTERAPI_IO:
+    required_vars = ['TWITTERAPI_IO_KEY', 'TELEGRAM_BOT_TOKEN', 'TELEGRAM_CHAT_ID']
+    api_note = 'Note: Using TwitterAPI.io - you only need TWITTERAPI_IO_KEY'
+else:
+    required_vars = ['X_BEARER_TOKEN', 'TELEGRAM_BOT_TOKEN', 'TELEGRAM_CHAT_ID']
+    api_note = 'Note: Using X API - you only need X_BEARER_TOKEN (not the full API keys)'
+
 missing_vars = [var for var in required_vars if not os.getenv(var)]
 if missing_vars:
     logger.error(f'Missing required environment variables: {", ".join(missing_vars)}')
-    logger.info('Note: For this polling approach, you only need X_BEARER_TOKEN (not the full API keys)')
+    logger.info(api_note)
     exit(1)
 
 telegram_bot = Bot(token=TELEGRAM_BOT_TOKEN)
@@ -61,17 +73,34 @@ telegram_bot = Bot(token=TELEGRAM_BOT_TOKEN)
 # Configure Ollama client for local Docker instance
 ollama_client = ollama.Client(host=OLLAMA_HOST)
 
-# Log polling configuration
+# Log API backend and polling configuration
+if USE_TWITTERAPI_IO:
+    logger.info(f'🔧 API Backend: TwitterAPI.io (Cost-effective)')
+else:
+    logger.info(f'🔧 API Backend: X API (Traditional)')
+
 logger.info(f'📊 Polling interval: {POLLING_INTERVAL_MINUTES} minutes ({POLLING_INTERVAL_SECONDS} seconds)')
 if POLLING_INTERVAL_MINUTES >= 60:
     estimated_calls = int(285 * 20 / POLLING_INTERVAL_MINUTES)
-    logger.info(f'💚 Quota-friendly mode: ~{estimated_calls} API calls per month (within 100 limit)')
+    if USE_TWITTERAPI_IO:
+        estimated_cost = estimated_calls * 0.15 / 1000
+        logger.info(f'💚 Quota-friendly mode: ~{estimated_calls} API calls per month (~${estimated_cost:.3f} cost)')
+    else:
+        logger.info(f'💚 Quota-friendly mode: ~{estimated_calls} API calls per month (within 100 limit)')
 elif POLLING_INTERVAL_MINUTES <= 5:
     estimated_calls = int(285 * 20 / POLLING_INTERVAL_MINUTES)
-    logger.info(f'⚡ High-frequency mode: ~{estimated_calls} API calls per month (may exceed quota)')
+    if USE_TWITTERAPI_IO:
+        estimated_cost = estimated_calls * 0.15 / 1000
+        logger.info(f'⚡ High-frequency mode: ~{estimated_calls} API calls per month (~${estimated_cost:.2f} cost)')
+    else:
+        logger.info(f'⚡ High-frequency mode: ~{estimated_calls} API calls per month (may exceed quota)')
 else:
     estimated_calls = int(285 * 20 / POLLING_INTERVAL_MINUTES)
-    logger.info(f'🔄 Custom interval: ~{estimated_calls} API calls per month')
+    if USE_TWITTERAPI_IO:
+        estimated_cost = estimated_calls * 0.15 / 1000
+        logger.info(f'🔄 Custom interval: ~{estimated_calls} API calls per month (~${estimated_cost:.2f} cost)')
+    else:
+        logger.info(f'🔄 Custom interval: ~{estimated_calls} API calls per month')
 
 school_terms = [
     (datetime(2025, 2, 4), datetime(2025, 4, 11)),
@@ -375,6 +404,197 @@ async def fetch_and_process_tweets():
         logger.error(f'Error in fetch_and_process_tweets: {e}')
         return False
 
+def convert_twitterapi_response(tweet_data):
+    """
+    Convert TwitterAPI.io tweet format to internal tweet object format
+    
+    TwitterAPI.io format example:
+    {
+        "id": "1234567890123456789",
+        "text": "Tweet content here",
+        "created_at": "2024-01-15T10:30:00.000Z",
+        "public_metrics": {
+            "retweet_count": 5,
+            "like_count": 12,
+            "reply_count": 3,
+            "quote_count": 1
+        },
+        "author_id": "987654321",
+        ...
+    }
+    
+    Internal format needed:
+    - tweet.id (int)
+    - tweet.text (str)  
+    - tweet.created_at (datetime with timezone)
+    - tweet.public_metrics (dict, optional)
+    """
+    try:
+        if not tweet_data or 'id' not in tweet_data or 'text' not in tweet_data:
+            logger.debug(f'⚠️  Invalid tweet data: missing id or text')
+            return None
+        
+        # Create a simple object to match the expected interface
+        class TweetObject:
+            def __init__(self, tweet_id, text, created_at, public_metrics=None):
+                self.id = tweet_id
+                self.text = text
+                self.created_at = created_at
+                self.public_metrics = public_metrics or {}
+        
+        # Extract and convert tweet ID
+        try:
+            tweet_id = int(tweet_data['id'])
+        except (ValueError, KeyError):
+            logger.debug(f'⚠️  Invalid tweet ID: {tweet_data.get("id")}')
+            return None
+        
+        # Extract tweet text
+        text = tweet_data.get('text', '').strip()
+        if not text:
+            logger.debug(f'⚠️  Empty tweet text for ID: {tweet_id}')
+            return None
+        
+        # Parse created_at timestamp
+        created_at_str = tweet_data.get('created_at', '')
+        try:
+            if created_at_str:
+                # TwitterAPI.io typically returns ISO format: "2024-01-15T10:30:00.000Z"
+                # Parse and convert to timezone-aware datetime
+                if created_at_str.endswith('Z'):
+                    created_at_str = created_at_str[:-1] + '+00:00'
+                elif not created_at_str.endswith(('+', '-')):
+                    created_at_str += '+00:00'
+                
+                created_at = datetime.fromisoformat(created_at_str)
+            else:
+                # Fallback to current time if no timestamp provided
+                logger.debug(f'⚠️  No created_at timestamp for tweet {tweet_id}, using current time')
+                created_at = datetime.now(dateutil.tz.UTC)
+        except (ValueError, TypeError) as e:
+            logger.debug(f'⚠️  Invalid created_at format for tweet {tweet_id}: {created_at_str} - {e}')
+            created_at = datetime.now(dateutil.tz.UTC)
+        
+        # Extract public metrics (optional)
+        public_metrics = tweet_data.get('public_metrics', {})
+        
+        # Create and return the tweet object
+        tweet_obj = TweetObject(
+            tweet_id=tweet_id,
+            text=text,
+            created_at=created_at,
+            public_metrics=public_metrics
+        )
+        
+        logger.debug(f'✅ Converted tweet {tweet_id}: "{text[:50]}..." ({created_at})')
+        return tweet_obj
+        
+    except Exception as e:
+        logger.error(f'❌ Error converting TwitterAPI.io tweet data: {e}')
+        logger.debug(f'   Raw data: {tweet_data}')
+        return None
+
+async def fetch_tweets_twitterapi():
+    """
+    TwitterAPI.io implementation to fetch and process tweets
+    Replaces fetch_and_process_tweets() when USE_TWITTERAPI_IO is True
+    """
+    try:
+        # TwitterAPI.io endpoint for T8SydneyTrains tweets
+        url = 'https://api.twitterapi.io/twitter/user/last_tweets'
+        headers = {
+            'x-api-key': TWITTERAPI_IO_KEY,
+            'Content-Type': 'application/json'
+        }
+        params = {
+            'userName': 'T8SydneyTrains',
+            'count': 10  # Fetch last 10 tweets (equivalent to max_results)
+        }
+        
+        logger.debug(f'🔗 TwitterAPI.io request: {url}?userName=T8SydneyTrains&count=10')
+        
+        # Use aiohttp for async HTTP requests
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, headers=headers, params=params, timeout=aiohttp.ClientTimeout(total=15)) as response:
+                # Log response details
+                logger.debug(f'📊 TwitterAPI.io response: {response.status}')
+                
+                if response.status != 200:
+                    error_text = await response.text()
+                    logger.error(f'❌ TwitterAPI.io request failed: HTTP {response.status}')
+                    logger.error(f'   Response: {error_text[:200]}...')
+                    
+                    # Handle specific error codes
+                    if response.status == 401:
+                        logger.error('🔑 Authentication failed - check TWITTERAPI_IO_KEY')
+                    elif response.status == 429:
+                        logger.error('⏰ Rate limit exceeded - reduce polling frequency')
+                    elif response.status >= 500:
+                        logger.error('🔧 TwitterAPI.io server error - try again later')
+                    
+                    return False
+                
+                data = await response.json()
+                
+                # Check if we have tweets in the response
+                if not data or 'tweets' not in data or not data['tweets']:
+                    logger.debug('📭 No tweets found in TwitterAPI.io response')
+                    return True
+                
+                # Process tweets using the same logic as X API
+                tweets_data = data['tweets']
+                logger.debug(f'📥 Retrieved {len(tweets_data)} tweets from TwitterAPI.io')
+                
+                # Convert TwitterAPI.io format to our internal format and process
+                last_tweet_id = load_last_tweet_id()
+                alerts_sent = 0
+                latest_tweet_id = last_tweet_id
+                processed_tweets = []
+                
+                for tweet_data in tweets_data:
+                    # Convert TwitterAPI.io tweet to our internal format
+                    converted_tweet = convert_twitterapi_response(tweet_data)
+                    if not converted_tweet:
+                        continue
+                    
+                    # Skip if we've already processed this tweet (fresh start approach)
+                    tweet_id_str = str(converted_tweet.id)
+                    if last_tweet_id and tweet_id_str <= str(last_tweet_id):
+                        logger.debug(f'⏭️  Skipping already processed tweet: {tweet_id_str}')
+                        continue
+                    
+                    processed_tweets.append(converted_tweet)
+                    latest_tweet_id = max(int(latest_tweet_id or 0), converted_tweet.id)
+                
+                # Process tweets in chronological order (oldest first)
+                processed_tweets.reverse()
+                
+                for tweet in processed_tweets:
+                    if await process_tweet(tweet):
+                        alerts_sent += 1
+                
+                # Save the latest tweet ID for next run
+                if latest_tweet_id and latest_tweet_id != last_tweet_id:
+                    save_last_tweet_id(str(latest_tweet_id))
+                
+                # Log results
+                if alerts_sent > 0:
+                    logger.info(f'✅ TwitterAPI.io: Processed {len(processed_tweets)} tweets, sent {alerts_sent} alerts')
+                else:
+                    logger.debug(f'📋 TwitterAPI.io: Processed {len(processed_tweets)} tweets, no alerts sent')
+                
+                return True
+                
+    except aiohttp.ClientError as e:
+        logger.error(f'❌ TwitterAPI.io network error: {e}')
+        return False
+    except asyncio.TimeoutError:
+        logger.error(f'⏰ TwitterAPI.io request timeout')
+        return False
+    except Exception as e:
+        logger.error(f'❌ Error in fetch_tweets_twitterapi: {e}')
+        return False
+
 async def test_telegram_connection():
     try:
         bot_info = await telegram_bot.get_me()
@@ -392,6 +612,57 @@ async def test_twitter_connection():
         return True
     except Exception as e:
         logger.error(f'Twitter API connection test failed: {e}')
+        return False
+
+async def test_twitterapi_connection():
+    """Test TwitterAPI.io connection for startup validation"""
+    try:
+        if not TWITTERAPI_IO_KEY:
+            logger.error('TwitterAPI.io API key not found in environment variables')
+            return False
+        
+        # Test with T8SydneyTrains user profile
+        url = 'https://api.twitterapi.io/twitter/user/profile'
+        headers = {'x-api-key': TWITTERAPI_IO_KEY}
+        params = {'userName': 'T8SydneyTrains'}
+        
+        logger.debug(f'🧪 Testing TwitterAPI.io connection to {url}')
+        
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, headers=headers, params=params, timeout=aiohttp.ClientTimeout(total=10)) as response:
+                if response.status == 200:
+                    try:
+                        data = await response.json()
+                        user_name = data.get('userName', 'unknown')
+                        followers = data.get('followersCount', 'N/A')
+                        logger.info(f'✅ TwitterAPI.io connected, found @{user_name} (Followers: {followers})')
+                        return True
+                    except Exception as e:
+                        logger.error(f'❌ TwitterAPI.io response parsing failed: {e}')
+                        return False
+                elif response.status == 401:
+                    logger.error('❌ TwitterAPI.io authentication failed - check TWITTERAPI_IO_KEY')
+                    return False
+                elif response.status == 429:
+                    logger.warning('⚠️  TwitterAPI.io rate limit hit - API key is valid but throttled')
+                    return True  # API key works, just rate limited
+                elif response.status == 404:
+                    logger.error('❌ TwitterAPI.io user not found or endpoint unavailable')
+                    return False
+                else:
+                    error_text = await response.text()
+                    logger.error(f'❌ TwitterAPI.io connection failed: HTTP {response.status}')
+                    logger.debug(f'   Response: {error_text[:200]}...')
+                    return False
+                    
+    except aiohttp.ClientError as e:
+        logger.error(f'❌ TwitterAPI.io network error: {e}')
+        return False
+    except asyncio.TimeoutError:
+        logger.error(f'❌ TwitterAPI.io connection timeout')
+        return False
+    except Exception as e:
+        logger.error(f'❌ TwitterAPI.io connection test failed: {e}')
         return False
 
 async def log_heartbeat():
