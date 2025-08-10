@@ -17,7 +17,9 @@ A Python script that monitors the Sydney Trains T8 Airport Line Twitter account 
 
 ## Prerequisites
 
-1. **Twitter Developer Account**: Get API credentials from [developer.twitter.com](https://developer.twitter.com/)
+1. **Twitter API Access** (Choose one):
+   - **TwitterAPI.io** (Recommended): Simple signup at [twitterapi.io](https://twitterapi.io/) - $0.15 per 1,000 tweets
+   - **X API**: Traditional developer account from [developer.twitter.com](https://developer.twitter.com/)
 2. **Telegram Bot**: Create a bot using [@BotFather](https://t.me/BotFather) on Telegram
 3. **Python 3.7+**: Required for async/await support
 
@@ -126,9 +128,26 @@ python setup_env_simple.py
 ```
 
 **Option B: Manual Environment Variables**
+
+For **TwitterAPI.io** (Recommended):
 ```bash
-# Twitter Bearer Token (simplified approach)
+# TwitterAPI.io Configuration
+export TWITTERAPI_IO_KEY="your_twitterapi_io_key_here"
+export USE_TWITTERAPI_IO=true
+
+# Telegram Bot Credentials
+export TELEGRAM_BOT_TOKEN="your_telegram_bot_token_here"
+export TELEGRAM_CHAT_ID="your_telegram_chat_id_here"
+
+# Optional: Custom polling interval (default: 60 minutes)
+export POLLING_INTERVAL_MINUTES=60
+```
+
+For **X API** (Traditional):
+```bash
+# X API Configuration
 export X_BEARER_TOKEN="your_twitter_bearer_token_here"
+export USE_TWITTERAPI_IO=false
 
 # Telegram Bot Credentials
 export TELEGRAM_BOT_TOKEN="your_telegram_bot_token_here"
@@ -139,27 +158,95 @@ export POLLING_INTERVAL_MINUTES=60
 ```
 
 **Option C: .env File**
-Create a `.env` file in the project directory:
+
+For **TwitterAPI.io** (Recommended):
 ```
-X_BEARER_TOKEN=your_twitter_bearer_token_here
+# TwitterAPI.io Configuration
+TWITTERAPI_IO_KEY=your_twitterapi_io_key_here
+USE_TWITTERAPI_IO=true
+
+# Telegram Bot Credentials
 TELEGRAM_BOT_TOKEN=your_telegram_bot_token_here
 TELEGRAM_CHAT_ID=your_telegram_chat_id_here
+
+# Optional Configuration
 POLLING_INTERVAL_MINUTES=60
+OLLAMA_MODEL=llama3.2:3b
+OLLAMA_HOST=http://localhost:11434
+```
+
+For **X API** (Traditional):
+```
+# X API Configuration
+X_BEARER_TOKEN=your_twitter_bearer_token_here
+USE_TWITTERAPI_IO=false
+
+# Telegram Bot Credentials
+TELEGRAM_BOT_TOKEN=your_telegram_bot_token_here
+TELEGRAM_CHAT_ID=your_telegram_chat_id_here
+
+# Optional Configuration
+POLLING_INTERVAL_MINUTES=60
+OLLAMA_MODEL=llama3.2:3b
+OLLAMA_HOST=http://localhost:11434
 ```
 
 ## Getting API Credentials
 
-### Twitter API Setup
+### TwitterAPI.io Setup (Recommended)
+1. Go to [twitterapi.io](https://twitterapi.io/)
+2. Sign up for an account (no approval process required)
+3. Navigate to your dashboard
+4. Copy your **API Key** (starts with your account info)
+5. **Cost**: $0.15 per 1,000 tweets (very affordable for monitoring)
+
+### X API Setup (Traditional)
 1. Go to [developer.twitter.com](https://developer.twitter.com/)
-2. Create a new app
-3. Generate API keys and tokens
-4. Copy the **Bearer Token** (this is all you need for the polling version)
+2. Apply for developer account (approval required)
+3. Create a new app
+4. Generate API keys and tokens
+5. Copy the **Bearer Token** (this is all you need for the polling version)
+6. **Note**: May have usage limits and higher costs
 
 ### Telegram Bot Setup
 1. Message [@BotFather](https://t.me/BotFather) on Telegram
 2. Create a new bot with `/newbot`
 3. Get your bot token
 4. Get your chat ID by messaging [@userinfobot](https://t.me/userinfobot)
+
+## Environment Variables Reference
+
+### Required Variables
+
+**For TwitterAPI.io (Recommended):**
+- `TWITTERAPI_IO_KEY`: Your API key from twitterapi.io dashboard
+- `USE_TWITTERAPI_IO`: Set to `true` to enable TwitterAPI.io
+- `TELEGRAM_BOT_TOKEN`: Your Telegram bot token from @BotFather
+- `TELEGRAM_CHAT_ID`: Your Telegram chat ID from @userinfobot
+
+**For X API (Traditional):**
+- `X_BEARER_TOKEN`: Your Twitter Bearer Token from developer.twitter.com
+- `USE_TWITTERAPI_IO`: Set to `false` to use X API
+- `TELEGRAM_BOT_TOKEN`: Your Telegram bot token from @BotFather
+- `TELEGRAM_CHAT_ID`: Your Telegram chat ID from @userinfobot
+
+### Optional Variables
+
+- `POLLING_INTERVAL_MINUTES`: Polling interval in minutes (default: 60)
+- `OLLAMA_MODEL`: AI model for tweet analysis (default: llama3.2:3b)
+- `OLLAMA_HOST`: Ollama server URL (default: http://localhost:11434)
+
+### Migration Variables
+
+During the migration from X API to TwitterAPI.io, you can have both sets of credentials:
+```bash
+# Current X API (will be phased out)
+X_BEARER_TOKEN=your_x_token_here
+
+# New TwitterAPI.io (migration target)
+TWITTERAPI_IO_KEY=your_twitterapi_io_key_here
+USE_TWITTERAPI_IO=true  # Set to true to switch to TwitterAPI.io
+```
 
 ## Testing Your Setup
 
