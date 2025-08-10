@@ -9,6 +9,7 @@ import os
 import sys
 from datetime import datetime
 import dateutil.tz
+import aiohttp
 
 # Load environment variables from .env file if it exists
 def load_env_file():
@@ -42,6 +43,43 @@ async def test_twitter_connection():
         
     except Exception as e:
         print(f"❌ Twitter API: Connection failed - {e}")
+        return False
+
+async def test_twitterapi_connection():
+    """Test TwitterAPI.io connection."""
+    try:
+        api_key = os.getenv('TWITTERAPI_IO_KEY')
+        if not api_key:
+            print("❌ TwitterAPI.io: API key not found")
+            return False
+        
+        # Test with T8SydneyTrains user profile
+        url = 'https://api.twitterapi.io/twitter/user/profile'
+        headers = {'x-api-key': api_key}
+        params = {'userName': 'T8SydneyTrains'}
+        
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, headers=headers, params=params, timeout=aiohttp.ClientTimeout(total=10)) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    user_name = data.get('userName', 'unknown')
+                    followers = data.get('followersCount', 'N/A')
+                    print(f"✅ TwitterAPI.io: Connected successfully")
+                    print(f"   Found @{user_name} (Followers: {followers})")
+                    return True
+                elif response.status == 401:
+                    print("❌ TwitterAPI.io: Authentication failed - check API key")
+                    return False
+                elif response.status == 429:
+                    print("⚠️  TwitterAPI.io: Rate limit hit - API key works but throttled")
+                    return True  # API key is valid
+                else:
+                    error_text = await response.text()
+                    print(f"❌ TwitterAPI.io: Connection failed - HTTP {response.status}")
+                    return False
+                    
+    except Exception as e:
+        print(f"❌ TwitterAPI.io: Connection failed - {e}")
         return False
 
 async def test_telegram_connection():
@@ -106,11 +144,19 @@ async def main():
         print("⚠️  No .env file found, using system environment variables")
     print()
     
-    # Check required environment variables (only the ones we need for polling)
+    # Check which API backend to use
+    use_twitterapi_io = os.getenv('USE_TWITTERAPI_IO', 'false').lower() == 'true'
+    
+    # Check required environment variables based on API choice
     print("🔑 Checking Environment Variables")
     print("-" * 30)
     
-    required_vars = ['X_BEARER_TOKEN', 'TELEGRAM_BOT_TOKEN', 'TELEGRAM_CHAT_ID']
+    if use_twitterapi_io:
+        print("🔧 API Backend: TwitterAPI.io (Cost-effective)")
+        required_vars = ['TWITTERAPI_IO_KEY', 'TELEGRAM_BOT_TOKEN', 'TELEGRAM_CHAT_ID']
+    else:
+        print("🔧 API Backend: X API (Traditional)")
+        required_vars = ['X_BEARER_TOKEN', 'TELEGRAM_BOT_TOKEN', 'TELEGRAM_CHAT_ID']
     
     missing_vars = []
     for var in required_vars:
@@ -131,7 +177,12 @@ async def main():
     print("🌐 Testing API Connections")
     print("-" * 30)
     
-    twitter_ok = await test_twitter_connection()
+    # Test the appropriate API backend
+    if use_twitterapi_io:
+        twitter_ok = await test_twitterapi_connection()
+    else:
+        twitter_ok = await test_twitter_connection()
+    
     telegram_ok = await test_telegram_connection()
     
     print()
