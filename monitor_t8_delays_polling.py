@@ -73,6 +73,16 @@ telegram_bot = Bot(token=TELEGRAM_BOT_TOKEN)
 # Configure Ollama client for local Docker instance
 ollama_client = ollama.Client(host=OLLAMA_HOST)
 
+def api_backend_selector():
+    """
+    Select the appropriate API backend based on feature flag
+    Returns the correct fetch function for the active API
+    """
+    if USE_TWITTERAPI_IO:
+        return fetch_tweets_twitterapi
+    else:
+        return fetch_and_process_tweets
+
 # Log API backend and polling configuration
 if USE_TWITTERAPI_IO:
     logger.info(f'🔧 API Backend: TwitterAPI.io (Cost-effective)')
@@ -694,15 +704,25 @@ async def main():
         logger.error('Failed to connect to Telegram. Exiting.')
         return
     
-    if not await test_twitter_connection():
-        logger.error('Failed to connect to Twitter API. Exiting.')
-        return
+    # Test the appropriate API backend based on feature flag
+    if USE_TWITTERAPI_IO:
+        if not await test_twitterapi_connection():
+            logger.error('Failed to connect to TwitterAPI.io. Exiting.')
+            return
+    else:
+        if not await test_twitter_connection():
+            logger.error('Failed to connect to Twitter API. Exiting.')
+            return
     
     # Test Ollama connection (non-blocking)
     await test_ollama_connection()
     
     logger.info('All connections tested. Starting monitoring...')
     logger.info(f'🤖 Using Ollama model: {OLLAMA_MODEL} at {OLLAMA_HOST}')
+    if USE_TWITTERAPI_IO:
+        logger.info(f'🔧 Active API: TwitterAPI.io (Cost-effective, pay-per-use)')
+    else:
+        logger.info(f'🔧 Active API: X API (Traditional Twitter API)')
     logger.info(f'Monitoring mode: Polling every {POLLING_INTERVAL_MINUTES} minutes during school days and peak hours')
     
     heartbeat_counter = 0
@@ -713,7 +733,9 @@ async def main():
             
             if is_sydney_school_day(now) and is_within_time_window(now):
                 logger.debug(f'Checking for new tweets at {now.strftime("%H:%M:%S")}')
-                await fetch_and_process_tweets()
+                # Use feature flag to select API backend
+                fetch_function = api_backend_selector()
+                await fetch_function()
                 await asyncio.sleep(POLLING_INTERVAL_SECONDS)
                 heartbeat_counter += 1
             else:
