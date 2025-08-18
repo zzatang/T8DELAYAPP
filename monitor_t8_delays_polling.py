@@ -31,6 +31,12 @@ logging.basicConfig(
         logging.StreamHandler()
     ]
 )
+
+# Enable debug logging if DEBUG environment variable is set
+if os.getenv('DEBUG', '').lower() in ['true', '1', 'yes']:
+    logging.getLogger().setLevel(logging.DEBUG)
+    logging.getLogger('urllib3').setLevel(logging.INFO)  # Reduce HTTP noise
+    logging.getLogger('aiohttp').setLevel(logging.INFO)  # Reduce HTTP noise
 logger = logging.getLogger(__name__)
 
 # Configuration from environment variables
@@ -274,7 +280,10 @@ async def fallback_keyword_analysis(tweet_text):
             'extra travel time', 'allow extra', 'not running', 'service alert', 'altered',
             'incident', 'emergency', 'flooding', 'power supply', 'signal repairs', 
             'shuttle', 'reduced service', 'timetable order', 'longer journey', 'wait times',
-            'repairs', 'urgent', 'limited', 'diverted', 'gaps', 'less frequent', 'late'
+            'repairs', 'urgent', 'limited', 'diverted', 'gaps', 'less frequent', 'late',
+            'buses replace trains', 'replace trains', 'changed timetable', 'bus replacement',
+            'shuttle bus', 'buses replacing', 'replacement buses', 'timetable changes',
+            'service changes', 'amended timetable', 'modified timetable', 'trackwork'
         ]
         
         has_delay_content = any(keyword in text for keyword in delay_keywords)
@@ -318,42 +327,67 @@ async def process_tweet(tweet):
     try:
         now = datetime.now(dateutil.tz.gettz('Australia/Sydney'))
         tweet_time = tweet.created_at.astimezone(dateutil.tz.gettz('Australia/Sydney'))
+        time_diff = now - tweet_time
+        
+        logger.debug(f'🔍 TWEET PROCESSING DETAILS:')
+        logger.debug(f'   Tweet ID: {tweet.id}')
+        logger.debug(f'   Tweet Time: {tweet_time.strftime("%Y-%m-%d %H:%M:%S AEST")}')
+        logger.debug(f'   Current Time: {now.strftime("%Y-%m-%d %H:%M:%S AEST")}')
+        logger.debug(f'   Age: {str(time_diff).split(".")[0]}')
+        logger.debug(f'   Text Preview: {tweet.text[:100]}...')
         
         # Check if current time is within monitoring window
-        if not (is_sydney_school_day(now) and is_within_time_window(now)):
-            logger.debug(f'Outside monitoring window, skipping tweet: {tweet.text[:50]}...')
-            return False
+        is_school_day = is_sydney_school_day(now)
+        is_time_window = is_within_time_window(now)
+        
+        logger.debug(f'   School Day: {is_school_day}')
+        logger.debug(f'   Time Window: {is_time_window}')
+        
+        # IMPORTANT: Process tweets even outside monitoring window for debugging
+        # This helps identify if tweets are being retrieved but filtered out
+        if not (is_school_day and is_time_window):
+            logger.info(f'⏸️  Outside monitoring window, but processing for debug: {tweet.text[:50]}...')
+            # Continue processing instead of returning False
         
         # Check if tweet was posted within 2 hours of current check time
-        time_diff = now - tweet_time
         if time_diff > timedelta(hours=2):
-            logger.debug(f'Tweet too old ({time_diff}), skipping: {tweet.text[:50]}...')
-            return False
+            logger.info(f'⏰ Tweet older than 2 hours ({time_diff}), but processing for debug: {tweet.text[:50]}...')
+            # Continue processing instead of returning False
         
         # Log tweet processing start
         logger.info(f'🚆 PROCESSING TWEET:')
         logger.info(f'📅 Tweet Time: {tweet_time.strftime("%Y-%m-%d %H:%M:%S AEST")}')
         logger.info(f'⏰ Current Time: {now.strftime("%Y-%m-%d %H:%M:%S AEST")}')
         logger.info(f'⏱️ Tweet Age: {str(time_diff).split(".")[0]}')
+        logger.info(f'📝 Full Tweet Text: "{tweet.text}"')
         
         # Use Ollama AI to analyze the tweet
         should_alert, confidence, reasoning = await analyze_tweet_with_ollama(tweet.text)
         
+        # Determine if we should actually send alert based on monitoring window
+        should_send_alert = should_alert and (is_school_day and is_time_window) and (time_diff <= timedelta(hours=2))
+        
         if should_alert:
-            message = (
-                f'🚆 T8 Airport Line Alert:\n\n'
-                f'{tweet.text}\n\n'
-                f'📅 Tweet: {tweet_time.strftime("%Y-%m-%d %H:%M:%S AEST")}\n'
-                f'⏰ Alert: {now.strftime("%Y-%m-%d %H:%M:%S AEST")}\n'
-                f'⏱️ Age: {str(time_diff).split(".")[0]} ago\n'
-                f'🤖 AI Confidence: {confidence}\n'
-                f'💭 Reasoning: {reasoning}'
-            )
-            await telegram_bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=message)
-            logger.info(f'✅ TELEGRAM ALERT SENT ({confidence} confidence)')
-            return True
+            if should_send_alert:
+                message = (
+                    f'🚆 T8 Airport Line Alert:\n\n'
+                    f'{tweet.text}\n\n'
+                    f'📅 Tweet: {tweet_time.strftime("%Y-%m-%d %H:%M:%S AEST")}\n'
+                    f'⏰ Alert: {now.strftime("%Y-%m-%d %H:%M:%S AEST")}\n'
+                    f'⏱️ Age: {str(time_diff).split(".")[0]} ago\n'
+                    f'🤖 AI Confidence: {confidence}\n'
+                    f'💭 Reasoning: {reasoning}'
+                )
+                await telegram_bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=message)
+                logger.info(f'✅ TELEGRAM ALERT SENT ({confidence} confidence)')
+                return True
+            else:
+                logger.info(f'🔇 ALERT SUPPRESSED - Outside monitoring window or too old ({confidence} confidence)')
+                logger.info(f'   Would have sent: {reasoning}')
+                return False
         else:
-            logger.info(f'❌ NO TELEGRAM ALERT SENT ({confidence} confidence)')
+            logger.info(f'❌ NO ALERT NEEDED ({confidence} confidence)')
+            logger.info(f'   Reasoning: {reasoning}')
             return False
     except Exception as e:
         logger.error(f'Error processing tweet: {e}')
@@ -361,20 +395,30 @@ async def process_tweet(tweet):
 
 async def fetch_and_process_tweets():
     try:
+        logger.debug('🔗 Creating X API client...')
         client = tweepy.Client(bearer_token=X_BEARER_TOKEN)
+        
         try:
+            logger.debug('👤 Looking up @T8SydneyTrains user...')
             user = client.get_user(username='T8SydneyTrains')
             user_id = user.data.id
-            logger.debug(f'Found user ID for @T8SydneyTrains: {user_id}')
+            logger.debug(f'✅ Found user ID for @T8SydneyTrains: {user_id}')
         except Exception as e:
-            logger.error(f'Error fetching user ID for @T8SydneyTrains: {e}')
+            logger.error(f'❌ Error fetching user ID for @T8SydneyTrains: {e}')
+            if "429" in str(e):
+                logger.error('   Rate limit exceeded. Try increasing POLLING_INTERVAL_MINUTES')
+            elif "403" in str(e):
+                logger.error('   Authentication failed. Check your X_BEARER_TOKEN')
             return False
         
         last_tweet_id = load_last_tweet_id()
+        logger.debug(f'📋 Last processed tweet ID: {last_tweet_id or "None (first run)"}')
+        
         try:
             # Increase lookback window for longer polling intervals
             lookback_hours = max(2, POLLING_INTERVAL_MINUTES // 30 + 1)
             since_time = datetime.now(dateutil.tz.UTC) - timedelta(hours=lookback_hours)
+            logger.debug(f'🕐 Looking back {lookback_hours} hours to {since_time.strftime("%Y-%m-%d %H:%M:%S UTC")}')
             
             kwargs = {
                 'max_results': 10,
@@ -383,29 +427,42 @@ async def fetch_and_process_tweets():
             }
             if last_tweet_id:
                 kwargs['since_id'] = last_tweet_id
+                logger.debug(f'🔄 Using since_id filter: {last_tweet_id}')
             
+            logger.debug('📡 Fetching tweets from X API...')
             tweets = client.get_users_tweets(user_id, **kwargs)
+            
             if not tweets.data:
-                logger.debug('No new tweets found')
+                logger.debug('📭 No new tweets found in the specified time window')
+                logger.debug(f'   Search criteria: user_id={user_id}, max_results=10, since={since_time}')
+                if last_tweet_id:
+                    logger.debug(f'   Since tweet ID: {last_tweet_id}')
                 return True
             
             tweets_list = list(tweets.data)
-            tweets_list.reverse()
+            tweets_list.reverse()  # Process oldest first
+            logger.info(f'📥 Retrieved {len(tweets_list)} new tweets from X API')
+            
             alerts_sent = 0
             latest_tweet_id = last_tweet_id
             
-            for tweet in tweets_list:
+            for i, tweet in enumerate(tweets_list):
+                logger.debug(f'🔍 Processing tweet {i+1}/{len(tweets_list)}: ID {tweet.id}')
+                logger.debug(f'   Text: {tweet.text[:100]}...')
+                logger.debug(f'   Created: {tweet.created_at}')
+                
                 if await process_tweet(tweet):
                     alerts_sent += 1
                 latest_tweet_id = tweet.id
             
-            if latest_tweet_id:
+            if latest_tweet_id and latest_tweet_id != last_tweet_id:
                 save_last_tweet_id(latest_tweet_id)
+                logger.debug(f'💾 Saved latest tweet ID: {latest_tweet_id}')
             
             if alerts_sent > 0:
-                logger.info(f'Processed {len(tweets_list)} tweets, sent {alerts_sent} alerts')
+                logger.info(f'✅ X API: Processed {len(tweets_list)} tweets, sent {alerts_sent} alerts')
             else:
-                logger.debug(f'Processed {len(tweets_list)} tweets, no alerts sent')
+                logger.debug(f'📋 X API: Processed {len(tweets_list)} tweets, no alerts sent')
             return True
         except Exception as e:
             logger.error(f'Error fetching tweets: {e}')
@@ -418,18 +475,19 @@ def convert_twitterapi_response(tweet_data):
     """
     Convert TwitterAPI.io tweet format to internal tweet object format
     
-    TwitterAPI.io format example:
+    TwitterAPI.io actual format:
     {
-        "id": "1234567890123456789",
+        "type": "tweet",
+        "id": "1957321619568808194",
+        "url": "https://x.com/T8SydneyTrains/status/1957321619568808194",
         "text": "Tweet content here",
-        "created_at": "2024-01-15T10:30:00.000Z",
-        "public_metrics": {
-            "retweet_count": 5,
-            "like_count": 12,
-            "reply_count": 3,
-            "quote_count": 1
-        },
-        "author_id": "987654321",
+        "createdAt": "Mon Aug 18 06:00:14 +0000 2025",
+        "retweetCount": 1,
+        "replyCount": 0,
+        "likeCount": 2,
+        "quoteCount": 0,
+        "viewCount": 417,
+        "lang": "en",
         ...
     }
     
@@ -440,8 +498,16 @@ def convert_twitterapi_response(tweet_data):
     - tweet.public_metrics (dict, optional)
     """
     try:
-        if not tweet_data or 'id' not in tweet_data or 'text' not in tweet_data:
-            logger.debug(f'⚠️  Invalid tweet data: missing id or text')
+        if not tweet_data or 'id' not in tweet_data:
+            logger.debug(f'⚠️  Invalid tweet data: missing id')
+            logger.debug(f'   Available keys: {list(tweet_data.keys()) if isinstance(tweet_data, dict) else "Not a dict"}')
+            return None
+        
+        # TwitterAPI.io uses 'text' field, but let's check both 'text' and 'full_text'
+        text = tweet_data.get('text') or tweet_data.get('full_text', '')
+        if not text:
+            logger.debug(f'⚠️  Invalid tweet data: missing text content')
+            logger.debug(f'   Available keys: {list(tweet_data.keys())}')
             return None
         
         # Create a simple object to match the expected interface
@@ -465,28 +531,33 @@ def convert_twitterapi_response(tweet_data):
             logger.debug(f'⚠️  Empty tweet text for ID: {tweet_id}')
             return None
         
-        # Parse created_at timestamp
-        created_at_str = tweet_data.get('created_at', '')
+        # Parse created_at timestamp - TwitterAPI.io uses 'createdAt' field
+        created_at_str = tweet_data.get('createdAt') or tweet_data.get('created_at', '')
         try:
             if created_at_str:
-                # TwitterAPI.io typically returns ISO format: "2024-01-15T10:30:00.000Z"
-                # Parse and convert to timezone-aware datetime
-                if created_at_str.endswith('Z'):
-                    created_at_str = created_at_str[:-1] + '+00:00'
-                elif not created_at_str.endswith(('+', '-')):
-                    created_at_str += '+00:00'
-                
-                created_at = datetime.fromisoformat(created_at_str)
+                # TwitterAPI.io returns format like: "Mon Aug 18 06:00:14 +0000 2025"
+                # This is Twitter's standard format, need to parse it properly
+                import dateutil.parser
+                created_at = dateutil.parser.parse(created_at_str)
+                # Ensure it's timezone-aware
+                if created_at.tzinfo is None:
+                    created_at = created_at.replace(tzinfo=dateutil.tz.UTC)
             else:
                 # Fallback to current time if no timestamp provided
-                logger.debug(f'⚠️  No created_at timestamp for tweet {tweet_id}, using current time')
+                logger.debug(f'⚠️  No createdAt timestamp for tweet {tweet_id}, using current time')
                 created_at = datetime.now(dateutil.tz.UTC)
         except (ValueError, TypeError) as e:
-            logger.debug(f'⚠️  Invalid created_at format for tweet {tweet_id}: {created_at_str} - {e}')
+            logger.debug(f'⚠️  Invalid createdAt format for tweet {tweet_id}: {created_at_str} - {e}')
             created_at = datetime.now(dateutil.tz.UTC)
         
-        # Extract public metrics (optional)
-        public_metrics = tweet_data.get('public_metrics', {})
+        # Extract public metrics (optional) - TwitterAPI.io uses different field names
+        public_metrics = {
+            'retweet_count': tweet_data.get('retweetCount', 0),
+            'like_count': tweet_data.get('likeCount', 0),
+            'reply_count': tweet_data.get('replyCount', 0),
+            'quote_count': tweet_data.get('quoteCount', 0),
+            'view_count': tweet_data.get('viewCount', 0)
+        }
         
         # Create and return the tweet object
         tweet_obj = TweetObject(
@@ -522,6 +593,7 @@ async def fetch_tweets_twitterapi():
         }
         
         logger.debug(f'🔗 TwitterAPI.io request: {url}?userName=T8SydneyTrains&count=10')
+        logger.debug(f'🔑 Using API key: {TWITTERAPI_IO_KEY[:8]}...{TWITTERAPI_IO_KEY[-4:]}')
         
         # Use aiohttp for async HTTP requests
         async with aiohttp.ClientSession() as session:
@@ -546,25 +618,54 @@ async def fetch_tweets_twitterapi():
                 
                 data = await response.json()
                 
-                # Check if we have tweets in the response
-                if not data or 'tweets' not in data or not data['tweets']:
-                    logger.debug('📭 No tweets found in TwitterAPI.io response')
+                # Enhanced debugging for response structure
+                logger.debug(f'📊 TwitterAPI.io response structure: {list(data.keys()) if isinstance(data, dict) else type(data)}')
+                
+                # Check if we have tweets in the response - TwitterAPI.io nests tweets under data.data.tweets
+                tweets_data = None
+                if isinstance(data, dict):
+                    # TwitterAPI.io structure: response.data.data.tweets
+                    if 'data' in data and isinstance(data['data'], dict):
+                        if 'tweets' in data['data'] and data['data']['tweets']:
+                            tweets_data = data['data']['tweets']
+                            logger.info(f'✅ Found tweets in data.data.tweets: {len(tweets_data)} tweets')
+                        else:
+                            logger.debug(f'📭 No tweets in data.data.tweets. Available keys: {list(data["data"].keys())}')
+                            # Check if user is suspended or unavailable
+                            if data['data'].get('unavailable'):
+                                logger.warning(f'⚠️  User appears unavailable: {data["data"].get("message", "No message")}')
+                    # Fallback: check for tweets directly under data
+                    elif 'tweets' in data and data['tweets']:
+                        tweets_data = data['tweets']
+                        logger.info(f'✅ Found tweets directly under data: {len(tweets_data)} tweets')
+                    else:
+                        logger.debug(f'📭 No tweets found. Top-level keys: {list(data.keys())}')
+                        if 'data' in data:
+                            logger.debug(f'   data keys: {list(data["data"].keys()) if isinstance(data["data"], dict) else type(data["data"])}')
+                
+                if not tweets_data:
+                    logger.info('📭 No tweets found in TwitterAPI.io response')
                     return True
                 
                 # Process tweets using the same logic as X API
-                tweets_data = data['tweets']
-                logger.debug(f'📥 Retrieved {len(tweets_data)} tweets from TwitterAPI.io')
+                logger.info(f'📥 Retrieved {len(tweets_data)} tweets from TwitterAPI.io')
+                logger.debug(f'   Raw tweet count: {len(tweets_data)}')
                 
                 # Convert TwitterAPI.io format to our internal format and process
                 last_tweet_id = load_last_tweet_id()
+                logger.debug(f'📋 Last processed tweet ID: {last_tweet_id or "None (first run)"}')
+                
                 alerts_sent = 0
                 latest_tweet_id = last_tweet_id
                 processed_tweets = []
                 
-                for tweet_data in tweets_data:
+                for i, tweet_data in enumerate(tweets_data):
+                    logger.debug(f'🔄 Converting tweet {i+1}/{len(tweets_data)}')
+                    
                     # Convert TwitterAPI.io tweet to our internal format
                     converted_tweet = convert_twitterapi_response(tweet_data)
                     if not converted_tweet:
+                        logger.debug(f'   ❌ Failed to convert tweet {i+1}')
                         continue
                     
                     # Skip if we've already processed this tweet (fresh start approach)
@@ -572,6 +673,9 @@ async def fetch_tweets_twitterapi():
                     if last_tweet_id and tweet_id_str <= str(last_tweet_id):
                         logger.debug(f'⏭️  Skipping already processed tweet: {tweet_id_str}')
                         continue
+                    
+                    logger.debug(f'✅ New tweet {i+1}: ID {converted_tweet.id}')
+                    logger.debug(f'   Text: {converted_tweet.text[:100]}...')
                     
                     processed_tweets.append(converted_tweet)
                     latest_tweet_id = max(int(latest_tweet_id or 0), converted_tweet.id)
@@ -697,21 +801,68 @@ async def send_critical_error_alert(error_message):
     except Exception as e:
         logger.error(f"Failed to send critical error alert: {e}")
 
+async def startup_validation():
+    """Comprehensive startup validation and diagnostics"""
+    logger.info('🔍 Starting T8 Monitor Startup Validation...')
+    
+    # Check environment variables
+    logger.info('📋 Checking environment variables...')
+    if USE_TWITTERAPI_IO:
+        required_vars = ['TWITTERAPI_IO_KEY', 'TELEGRAM_BOT_TOKEN', 'TELEGRAM_CHAT_ID']
+        api_type = 'TwitterAPI.io'
+    else:
+        required_vars = ['X_BEARER_TOKEN', 'TELEGRAM_BOT_TOKEN', 'TELEGRAM_CHAT_ID']
+        api_type = 'X API'
+    
+    missing_vars = [var for var in required_vars if not os.getenv(var)]
+    if missing_vars:
+        logger.error(f'❌ Missing environment variables: {", ".join(missing_vars)}')
+        logger.error(f'   Run "python quick_setup.py" to configure credentials')
+        return False
+    
+    logger.info(f'✅ All required environment variables present for {api_type}')
+    
+    # Check current time window
+    now = datetime.now(dateutil.tz.gettz('Australia/Sydney'))
+    is_school_day = is_sydney_school_day(now)
+    is_time_window = is_within_time_window(now)
+    
+    logger.info(f'🕐 Current time: {now.strftime("%Y-%m-%d %H:%M:%S AEST (%A)")}')
+    logger.info(f'📚 School day: {"Yes" if is_school_day else "No"}')
+    logger.info(f'⏰ Monitoring window: {"Yes" if is_time_window else "No"}')
+    
+    if not (is_school_day and is_time_window):
+        logger.warning('⚠️  Currently outside monitoring window')
+        logger.info('   Monitoring windows: 7:00-8:45 AM and 1:00-4:00 PM AEST on school days')
+    
+    return True
+
 async def main():
-    logger.info('Starting T8 Delays Monitor with Ollama AI Analysis...')
+    logger.info('🚀 Starting T8 Delays Monitor with Ollama AI Analysis...')
+    
+    # Comprehensive startup validation
+    if not await startup_validation():
+        logger.error('❌ Startup validation failed. Exiting.')
+        return
+    
+    # Test connections
+    logger.info('🔗 Testing API connections...')
     
     if not await test_telegram_connection():
-        logger.error('Failed to connect to Telegram. Exiting.')
+        logger.error('❌ Failed to connect to Telegram. Exiting.')
+        logger.error('   Check your TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID')
         return
     
     # Test the appropriate API backend based on feature flag
     if USE_TWITTERAPI_IO:
         if not await test_twitterapi_connection():
-            logger.error('Failed to connect to TwitterAPI.io. Exiting.')
+            logger.error('❌ Failed to connect to TwitterAPI.io. Exiting.')
+            logger.error('   Check your TWITTERAPI_IO_KEY')
             return
     else:
         if not await test_twitter_connection():
-            logger.error('Failed to connect to Twitter API. Exiting.')
+            logger.error('❌ Failed to connect to Twitter API. Exiting.')
+            logger.error('   Check your X_BEARER_TOKEN')
             return
     
     # Test Ollama connection (non-blocking)
