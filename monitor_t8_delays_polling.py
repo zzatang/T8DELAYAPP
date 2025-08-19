@@ -149,7 +149,7 @@ def is_within_time_window(check_time):
     hour = check_time.hour
     minute = check_time.minute
     morning_window = (hour == 7 or (hour == 8 and minute <= 45))
-    afternoon_window = (13 <= hour < 16 or (hour == 16 and minute == 0))
+    afternoon_window = (13 <= hour < 17 or (hour == 17 and minute <= 30))
     return morning_window or afternoon_window
 
 def load_last_tweet_id():
@@ -365,7 +365,9 @@ async def process_tweet(tweet):
         should_alert, confidence, reasoning = await analyze_tweet_with_ollama(tweet.text)
         
         # Determine if we should actually send alert based on monitoring window
-        should_send_alert = should_alert and (is_school_day and is_time_window) and (time_diff <= timedelta(hours=2))
+        # Allow longer age limit for high confidence alerts (up to 4 hours)
+        max_age = timedelta(hours=4) if confidence == "HIGH" else timedelta(hours=2)
+        should_send_alert = should_alert and (is_school_day and is_time_window) and (time_diff <= max_age)
         
         if should_alert:
             if should_send_alert:
@@ -887,7 +889,10 @@ async def main():
                 # Use feature flag to select API backend
                 fetch_function = api_backend_selector()
                 await fetch_function()
-                await asyncio.sleep(POLLING_INTERVAL_SECONDS)
+                
+                # Use shorter interval during monitoring windows for better responsiveness
+                active_interval = min(POLLING_INTERVAL_SECONDS, 10 * 60)  # Max 10 minutes during active hours
+                await asyncio.sleep(active_interval)
                 heartbeat_counter += 1
             else:
                 logger.debug(f'Outside monitoring window, next check in {POLLING_INTERVAL_MINUTES} minutes')
