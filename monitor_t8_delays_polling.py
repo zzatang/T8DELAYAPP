@@ -149,7 +149,7 @@ def is_within_time_window(check_time):
     hour = check_time.hour
     minute = check_time.minute
     morning_window = (hour == 7 or (hour == 8 and minute <= 45))
-    afternoon_window = (13 <= hour < 17 or (hour == 17 and minute <= 30))
+    afternoon_window = (12 <= hour < 16)
     return morning_window or afternoon_window
 
 def load_last_tweet_id():
@@ -835,7 +835,7 @@ async def startup_validation():
     
     if not (is_school_day and is_time_window):
         logger.warning('⚠️  Currently outside monitoring window')
-        logger.info('   Monitoring windows: 7:00-8:45 AM and 1:00-4:00 PM AEST on school days')
+        logger.info('   Monitoring windows: 7:00-8:45 AM and 12:00-4:00 PM AEST on school days')
     
     return True
 
@@ -890,9 +890,8 @@ async def main():
                 fetch_function = api_backend_selector()
                 await fetch_function()
                 
-                # Use shorter interval during monitoring windows for better responsiveness
-                active_interval = min(POLLING_INTERVAL_SECONDS, 10 * 60)  # Max 10 minutes during active hours
-                await asyncio.sleep(active_interval)
+                # Use the configured polling interval from .env
+                await asyncio.sleep(POLLING_INTERVAL_SECONDS)
                 heartbeat_counter += 1
             else:
                 logger.debug(f'Outside monitoring window, next check in {POLLING_INTERVAL_MINUTES} minutes')
