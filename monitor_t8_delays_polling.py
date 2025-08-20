@@ -200,6 +200,7 @@ NOT alert-worthy:
 - Routine announcements
 - Announcements about future trackwork
 - Future changes to services
+- Announcements about trackwork that scheduled to start outside school hours, that's Monday to Friday, 7am to 4pm.
 
 Respond EXACTLY in this format:
 ALERT: YES or NO
