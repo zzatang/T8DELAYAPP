@@ -178,29 +178,35 @@ async def analyze_tweet_with_ollama(tweet_text):
 
 Tweet: "{tweet_text}"
 
-Analyze this tweet and determine if it indicates:
-- Service delays, disruptions, or cancellations
-- Track/signal/power issues affecting services  
-- Reduced services or altered timetables
-- Emergency situations affecting trains
-- Platform changes or shuttle bus replacements
-- Any situation requiring "extra travel time"
+Analyze this tweet and determine if it indicates IMMEDIATE/CURRENT disruptions requiring urgent passenger action:
+- Service delays, disruptions, or cancellations happening NOW
+- Track/signal/power issues currently affecting services  
+- Reduced services or altered timetables in effect NOW
+- Emergency situations currently affecting trains
+- Platform changes or shuttle bus replacements active NOW
+- Any situation requiring "extra travel time" RIGHT NOW
 
-ALERT-WORTHY examples:
-- "Allow extra travel time due to..."
-- "Services suspended/cancelled/delayed"
-- "Trains not running between..."
-- "Reduced service due to..."
-- "Platform changes" 
-- "Shuttle buses replacing trains"
+CRITICAL: Only alert for IMMEDIATE disruptions, NOT future/scheduled trackwork or planned changes.
 
-NOT alert-worthy:
+ALERT-WORTHY examples (IMMEDIATE disruptions):
+- "Allow extra travel time due to..." (happening NOW)
+- "Services suspended/cancelled/delayed" (current disruption)
+- "Trains not running between..." (active now)
+- "Reduced service due to..." (current issue)
+- "Platform changes" (immediate change)
+- "Shuttle buses replacing trains" (active replacement)
+
+NOT alert-worthy (FUTURE/SCHEDULED events):
 - "Services restored to normal"
 - General information without service impact
 - Routine announcements
-- Announcements about future trackwork
-- Future changes to services
-- Announcements about trackwork that scheduled to start outside school hours, that's Monday to Friday, 7am to 4pm.
+- "Are you travelling on [future date]..." with trackwork
+- "From [time] to [time], trains may run to a changed timetable"
+- Scheduled trackwork announcements for future dates or weekends
+- "Due to trackwork between [stations]" for future dates
+- Weekend trackwork between stations
+- Trackwork scheduled outside school hours (Monday to Friday, 7am to 4pm)
+- Any announcement asking about future travel with planned disruptions
 
 Respond EXACTLY in this format:
 ALERT: YES or NO
@@ -352,8 +358,8 @@ async def process_tweet(tweet):
         
         # Check if tweet was posted within 2 hours of current check time
         if time_diff > timedelta(hours=2):
-            logger.info(f'⏰ Tweet older than 2 hours ({time_diff}), but processing for debug: {tweet.text[:50]}...')
-            # Continue processing instead of returning False
+            logger.info(f'⏰ Tweet older than 2 hours ({time_diff}), skipping: {tweet.text[:50]}...')
+            return False
         
         # Log tweet processing start
         logger.info(f'🚆 PROCESSING TWEET:')
@@ -424,7 +430,7 @@ async def fetch_and_process_tweets():
             logger.debug(f'🕐 Looking back {lookback_hours} hours to {since_time.strftime("%Y-%m-%d %H:%M:%S UTC")}')
             
             kwargs = {
-                'max_results': 10,
+                'max_results': 5,
                 'tweet_fields': ['created_at', 'public_metrics'],
                 'start_time': since_time
             }
@@ -437,7 +443,7 @@ async def fetch_and_process_tweets():
             
             if not tweets.data:
                 logger.debug('📭 No new tweets found in the specified time window')
-                logger.debug(f'   Search criteria: user_id={user_id}, max_results=10, since={since_time}')
+                logger.debug(f'   Search criteria: user_id={user_id}, max_results=5, since={since_time}')
                 if last_tweet_id:
                     logger.debug(f'   Since tweet ID: {last_tweet_id}')
                 return True
@@ -592,10 +598,11 @@ async def fetch_tweets_twitterapi():
         }
         params = {
             'userName': 'T8SydneyTrains',
-            'count': 10  # Fetch last 10 tweets (equivalent to max_results)
+            'count': 5  # Fetch last 5 tweets (equivalent to max_results)
         }
         
-        logger.debug(f'🔗 TwitterAPI.io request: {url}?userName=T8SydneyTrains&count=10')
+        logger.info(f'🔗 TwitterAPI.io request: {url}?userName=T8SydneyTrains&count=5')
+        logger.info(f'📋 Request params: {params}')
         logger.debug(f'🔑 Using API key: {TWITTERAPI_IO_KEY[:8]}...{TWITTERAPI_IO_KEY[-4:]}')
         
         # Use aiohttp for async HTTP requests
@@ -651,8 +658,11 @@ async def fetch_tweets_twitterapi():
                     return True
                 
                 # Process tweets using the same logic as X API
-                logger.info(f'📥 Retrieved {len(tweets_data)} tweets from TwitterAPI.io')
-                logger.debug(f'   Raw tweet count: {len(tweets_data)}')
+                logger.info(f'📥 Retrieved {len(tweets_data)} tweets from TwitterAPI.io (requested: 5)')
+                if len(tweets_data) > 5:
+                    logger.info(f'⚠️  API returned {len(tweets_data)} tweets but we requested only 5, limiting to 5 most recent')
+                    tweets_data = tweets_data[:5]  # Take only the first 5 tweets (most recent)
+                logger.debug(f'   Processing tweet count: {len(tweets_data)}')
                 
                 # Convert TwitterAPI.io format to our internal format and process
                 last_tweet_id = load_last_tweet_id()
