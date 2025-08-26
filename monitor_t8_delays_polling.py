@@ -132,6 +132,7 @@ public_holidays = [
 ]
 
 LAST_TWEET_FILE = 'last_tweet_id.txt'
+LAST_CHECK_FILE = 'last_check_time.txt'
 
 def is_sydney_school_day(check_date):
     if check_date.weekday() >= 5:
@@ -167,6 +168,27 @@ def save_last_tweet_id(tweet_id):
             f.write(str(tweet_id))
     except Exception as e:
         logger.warning(f'Error saving last tweet ID: {e}')
+
+def load_last_check_time():
+    """Load the last check time from file, or return 1 hour ago if first run"""
+    try:
+        if os.path.exists(LAST_CHECK_FILE):
+            with open(LAST_CHECK_FILE, 'r') as f:
+                time_str = f.read().strip()
+                return datetime.fromisoformat(time_str.replace('Z', '+00:00'))
+    except Exception as e:
+        logger.warning(f'Error loading last check time: {e}')
+    
+    # Default: check tweets from 1 hour ago
+    return datetime.now(dateutil.tz.UTC) - timedelta(hours=1)
+
+def save_last_check_time(check_time):
+    """Save the last check time to file"""
+    try:
+        with open(LAST_CHECK_FILE, 'w') as f:
+            f.write(check_time.isoformat())
+    except Exception as e:
+        logger.warning(f'Error saving last check time: {e}')
 
 async def analyze_tweet_with_ollama(tweet_text):
     """
@@ -586,132 +608,128 @@ def convert_twitterapi_response(tweet_data):
 
 async def fetch_tweets_twitterapi():
     """
-    TwitterAPI.io implementation to fetch and process tweets
-    Replaces fetch_and_process_tweets() when USE_TWITTERAPI_IO is True
+    TwitterAPI.io implementation using Advanced Search API (from blog post)
+    Only fetches NEW tweets since last check - much more efficient
     """
     try:
-        # TwitterAPI.io endpoint for T8SydneyTrains tweets
-        url = 'https://api.twitterapi.io/twitter/user/last_tweets'
-        headers = {
-            'x-api-key': TWITTERAPI_IO_KEY,
-            'Content-Type': 'application/json'
-        }
+        # Load last check time (blog post approach)
+        last_checked_time = load_last_check_time()
+        current_time = datetime.now(dateutil.tz.UTC)
+        
+        # Format times as strings in the format Twitter's API expects (from blog)
+        since_str = last_checked_time.strftime("%Y-%m-%d_%H:%M:%S_UTC")
+        until_str = current_time.strftime("%Y-%m-%d_%H:%M:%S_UTC")
+        
+        # Construct the query (exact format from blog post)
+        query = f"from:T8SydneyTrains since:{since_str} until:{until_str} include:nativeretweets"
+        
+        # API endpoint (from blog post)
+        url = "https://api.twitterapi.io/twitter/tweet/advanced_search"
+        
+        # Request parameters (from blog post)
         params = {
-            'userName': 'T8SydneyTrains',
-            'count': 5  # Fetch last 5 tweets (equivalent to max_results)
+            "query": query,
+            "queryType": "Latest"
         }
         
-        logger.info(f'🔗 TwitterAPI.io request: {url}?userName=T8SydneyTrains&count=5')
-        logger.info(f'📋 Request params: {params}')
-        logger.debug(f'🔑 Using API key: {TWITTERAPI_IO_KEY[:8]}...{TWITTERAPI_IO_KEY[-4:]}')
+        # Headers with API key (note: X-API-Key from blog, not x-api-key)
+        headers = {
+            "X-API-Key": TWITTERAPI_IO_KEY
+        }
         
-        # Use aiohttp for async HTTP requests
+        logger.info(f'🔗 TwitterAPI.io Advanced Search (blog post method)')
+        logger.info(f'📋 Query: {query}')
+        logger.info(f'🕐 Time window: {since_str} to {until_str}')
+        
+        # Make the request and handle pagination (from blog post)
+        all_tweets = []
+        next_cursor = None
+        
         async with aiohttp.ClientSession() as session:
-            async with session.get(url, headers=headers, params=params, timeout=aiohttp.ClientTimeout(total=15)) as response:
-                # Log response details
-                logger.debug(f'📊 TwitterAPI.io response: {response.status}')
+            while True:
+                # Add cursor to params if we have one (pagination from blog)
+                current_params = params.copy()
+                if next_cursor:
+                    current_params["cursor"] = next_cursor
                 
-                if response.status != 200:
-                    error_text = await response.text()
-                    logger.error(f'❌ TwitterAPI.io request failed: HTTP {response.status}')
-                    logger.error(f'   Response: {error_text[:200]}...')
+                async with session.get(url, headers=headers, params=current_params, timeout=aiohttp.ClientTimeout(total=15)) as response:
+                    # Log response details
+                    logger.debug(f'📊 TwitterAPI.io response: {response.status}')
                     
-                    # Handle specific error codes
-                    if response.status == 401:
-                        logger.error('🔑 Authentication failed - check TWITTERAPI_IO_KEY')
-                    elif response.status == 429:
-                        logger.error('⏰ Rate limit exceeded - reduce polling frequency')
-                    elif response.status >= 500:
-                        logger.error('🔧 TwitterAPI.io server error - try again later')
+                    if response.status != 200:
+                        error_text = await response.text()
+                        logger.error(f'❌ TwitterAPI.io Advanced Search failed: HTTP {response.status}')
+                        logger.error(f'   Response: {error_text[:200]}...')
+                        
+                        # Handle specific error codes
+                        if response.status == 401:
+                            logger.error('🔑 Authentication failed - check TWITTERAPI_IO_KEY')
+                        elif response.status == 429:
+                            logger.error('⏰ Rate limit exceeded - reduce polling frequency')
+                        elif response.status >= 500:
+                            logger.error('🔧 TwitterAPI.io server error - try again later')
+                        
+                        return False
                     
-                    return False
-                
-                data = await response.json()
-                
-                # Enhanced debugging for response structure
-                logger.debug(f'📊 TwitterAPI.io response structure: {list(data.keys()) if isinstance(data, dict) else type(data)}')
-                
-                # Check if we have tweets in the response - TwitterAPI.io nests tweets under data.data.tweets
-                tweets_data = None
-                if isinstance(data, dict):
-                    # TwitterAPI.io structure: response.data.data.tweets
-                    if 'data' in data and isinstance(data['data'], dict):
-                        if 'tweets' in data['data'] and data['data']['tweets']:
-                            tweets_data = data['data']['tweets']
-                            logger.info(f'✅ Found tweets in data.data.tweets: {len(tweets_data)} tweets')
-                        else:
-                            logger.debug(f'📭 No tweets in data.data.tweets. Available keys: {list(data["data"].keys())}')
-                            # Check if user is suspended or unavailable
-                            if data['data'].get('unavailable'):
-                                logger.warning(f'⚠️  User appears unavailable: {data["data"].get("message", "No message")}')
-                    # Fallback: check for tweets directly under data
-                    elif 'tweets' in data and data['tweets']:
-                        tweets_data = data['tweets']
-                        logger.info(f'✅ Found tweets directly under data: {len(tweets_data)} tweets')
+                    # Parse the response (blog post structure)
+                    data = await response.json()
+                    tweets = data.get("tweets", [])
+                    
+                    if tweets:
+                        all_tweets.extend(tweets)
+                        logger.debug(f'📥 Found {len(tweets)} tweets in this page')
+                    
+                    # Check if there are more pages (blog post pagination logic)
+                    if data.get("has_next_page", False) and data.get("next_cursor", "") != "":
+                        next_cursor = data.get("next_cursor")
+                        continue
                     else:
-                        logger.debug(f'📭 No tweets found. Top-level keys: {list(data.keys())}')
-                        if 'data' in data:
-                            logger.debug(f'   data keys: {list(data["data"].keys()) if isinstance(data["data"], dict) else type(data["data"])}')
-                
-                if not tweets_data:
-                    logger.info('📭 No tweets found in TwitterAPI.io response')
-                    return True
-                
-                # Process tweets using the same logic as X API
-                logger.info(f'📥 Retrieved {len(tweets_data)} tweets from TwitterAPI.io (requested: 5)')
-                if len(tweets_data) > 5:
-                    logger.info(f'⚠️  API returned {len(tweets_data)} tweets but we requested only 5, limiting to 5 most recent')
-                    tweets_data = tweets_data[:5]  # Take only the first 5 tweets (most recent)
-                logger.debug(f'   Processing tweet count: {len(tweets_data)}')
-                
-                # Convert TwitterAPI.io format to our internal format and process
-                last_tweet_id = load_last_tweet_id()
-                logger.debug(f'📋 Last processed tweet ID: {last_tweet_id or "None (first run)"}')
-                
-                alerts_sent = 0
-                latest_tweet_id = last_tweet_id
-                processed_tweets = []
-                
-                for i, tweet_data in enumerate(tweets_data):
-                    logger.debug(f'🔄 Converting tweet {i+1}/{len(tweets_data)}')
-                    
-                    # Convert TwitterAPI.io tweet to our internal format
-                    converted_tweet = convert_twitterapi_response(tweet_data)
-                    if not converted_tweet:
-                        logger.debug(f'   ❌ Failed to convert tweet {i+1}')
-                        continue
-                    
-                    # Skip if we've already processed this tweet (fresh start approach)
-                    tweet_id_str = str(converted_tweet.id)
-                    if last_tweet_id and tweet_id_str <= str(last_tweet_id):
-                        logger.debug(f'⏭️  Skipping already processed tweet: {tweet_id_str}')
-                        continue
-                    
-                    logger.debug(f'✅ New tweet {i+1}: ID {converted_tweet.id}')
-                    logger.debug(f'   Text: {converted_tweet.text[:100]}...')
-                    
-                    processed_tweets.append(converted_tweet)
-                    latest_tweet_id = max(int(latest_tweet_id or 0), converted_tweet.id)
-                
-                # Process tweets in chronological order (oldest first)
-                processed_tweets.reverse()
-                
-                for tweet in processed_tweets:
-                    if await process_tweet(tweet):
-                        alerts_sent += 1
-                
-                # Save the latest tweet ID for next run
-                if latest_tweet_id and latest_tweet_id != last_tweet_id:
-                    save_last_tweet_id(str(latest_tweet_id))
-                
-                # Log results
-                if alerts_sent > 0:
-                    logger.info(f'✅ TwitterAPI.io: Processed {len(processed_tweets)} tweets, sent {alerts_sent} alerts')
-                else:
-                    logger.debug(f'📋 TwitterAPI.io: Processed {len(processed_tweets)} tweets, no alerts sent')
-                
-                return True
-                
+                        break
+        
+        # Process all collected tweets (blog post approach)
+        if not all_tweets:
+            logger.info('📭 No new tweets found since last check')
+            save_last_check_time(current_time)  # Update timestamp even if no tweets
+            return True
+        
+        logger.info(f'📥 Found {len(all_tweets)} NEW tweets from T8SydneyTrains (Advanced Search)')
+        
+        # Convert TwitterAPI.io format to our internal format and process
+        alerts_sent = 0
+        processed_tweets = []
+        
+        for i, tweet_data in enumerate(all_tweets):
+            logger.debug(f'🔄 Converting tweet {i+1}/{len(all_tweets)}')
+            
+            # Convert TwitterAPI.io tweet to our internal format
+            converted_tweet = convert_twitterapi_response(tweet_data)
+            if not converted_tweet:
+                logger.debug(f'   ❌ Failed to convert tweet {i+1}')
+                continue
+            
+            logger.debug(f'✅ New tweet {i+1}: ID {converted_tweet.id}')
+            logger.debug(f'   Text: {converted_tweet.text[:100]}...')
+            
+            processed_tweets.append(converted_tweet)
+        
+        # Process tweets in chronological order (oldest first)
+        processed_tweets.reverse()
+        
+        for tweet in processed_tweets:
+            if await process_tweet(tweet):
+                alerts_sent += 1
+        
+        # Update the last checked time (blog post approach)
+        save_last_check_time(current_time)
+        
+        # Log results
+        if alerts_sent > 0:
+            logger.info(f'✅ TwitterAPI.io Advanced Search: Processed {len(processed_tweets)} tweets, sent {alerts_sent} alerts')
+        else:
+            logger.debug(f'📋 TwitterAPI.io Advanced Search: Processed {len(processed_tweets)} tweets, no alerts sent')
+        
+        return True
+        
     except aiohttp.ClientError as e:
         logger.error(f'❌ TwitterAPI.io network error: {e}')
         return False
@@ -719,7 +737,7 @@ async def fetch_tweets_twitterapi():
         logger.error(f'⏰ TwitterAPI.io request timeout')
         return False
     except Exception as e:
-        logger.error(f'❌ Error in fetch_tweets_twitterapi: {e}')
+        logger.error(f'❌ Error in fetch_tweets_twitterapi (Advanced Search): {e}')
         return False
 
 async def test_telegram_connection():
