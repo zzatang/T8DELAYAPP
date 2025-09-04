@@ -190,7 +190,7 @@ def save_last_check_time(check_time):
     except Exception as e:
         logger.warning(f'Error saving last check time: {e}')
 
-async def analyze_tweet_with_ollama(tweet_text):
+async def analyze_tweet_with_ollama(tweet_text, tweet_source="Unknown"):
     """
     Use local Ollama LLM to analyze if a tweet indicates service disruption
     Returns: (should_alert: bool, confidence: str, reasoning: str)
@@ -198,37 +198,46 @@ async def analyze_tweet_with_ollama(tweet_text):
     try:
         prompt = f"""You are analyzing a tweet from T8 Sydney Trains to determine if passengers should be alerted about service disruptions.
 
+Tweet Source: {tweet_source}
 Tweet: "{tweet_text}"
 
-Analyze this tweet and determine if it indicates IMMEDIATE/CURRENT disruptions requiring urgent passenger action:
-- Service delays, disruptions, or cancellations happening NOW
-- Track/signal/power issues currently affecting services  
-- Reduced services or altered timetables in effect NOW
-- Emergency situations currently affecting trains
-- Platform changes or shuttle bus replacements active NOW
-- Any situation requiring "extra travel time" RIGHT NOW
+CRITICAL FILTERING RULES:
+1. ONLY alert for T8 Airport Line service disruptions
+2. IGNORE tweets from Sydney Metro (@SydneyMetro) - these are about metro services, not T8 trains
+3. ONLY alert for IMMEDIATE/CURRENT disruptions, NOT future/scheduled events
+4. IGNORE weekend trackwork announcements (these are planned maintenance)
 
-CRITICAL: Only alert for IMMEDIATE disruptions, NOT future/scheduled trackwork or planned changes.
+Analyze this tweet and determine if it indicates IMMEDIATE/CURRENT T8 Airport Line disruptions requiring urgent passenger action:
+- Service delays, disruptions, or cancellations happening NOW on T8 line
+- Track/signal/power issues currently affecting T8 services  
+- Reduced T8 services or altered timetables in effect NOW
+- Emergency situations currently affecting T8 trains
+- T8 platform changes or shuttle bus replacements active NOW
+- Any situation requiring "extra travel time" on T8 line RIGHT NOW
 
-ALERT-WORTHY examples (IMMEDIATE disruptions):
-- "Allow extra travel time due to..." (happening NOW)
-- "Services suspended/cancelled/delayed" (current disruption)
-- "Trains not running between..." (active now)
-- "Reduced service due to..." (current issue)
-- "Platform changes" (immediate change)
-- "Shuttle buses replacing trains" (active replacement)
+ALERT-WORTHY examples (IMMEDIATE T8 disruptions):
+- "T8 Airport Line: Allow extra travel time due to..." (happening NOW)
+- "T8 services suspended/cancelled/delayed" (current disruption)
+- "T8 trains not running between..." (active now)
+- "Airport Line reduced service due to..." (current issue)
+- "T8 platform changes" (immediate change)
+- "Shuttle buses replacing T8 trains" (active replacement)
 
-NOT alert-worthy (FUTURE/SCHEDULED events):
+NOT alert-worthy (IGNORE these):
+- Sydney Metro service announcements (different service line)
 - "Services restored to normal"
-- General information without service impact
+- General information without T8 service impact
 - Routine announcements
+- "This weekend, metro services do not run..." (weekend trackwork)
 - "Are you travelling on [future date]..." with trackwork
 - "From [time] to [time], trains may run to a changed timetable"
 - Scheduled trackwork announcements for future dates or weekends
 - "Due to trackwork between [stations]" for future dates
-- Weekend trackwork between stations
+- Weekend trackwork between stations (planned maintenance)
 - Trackwork scheduled outside school hours (Monday to Friday, 7am to 4pm)
 - Any announcement asking about future travel with planned disruptions
+- Tweets about bus replacements for weekend trackwork
+- "Buses replace services between..." for weekend maintenance
 
 Respond EXACTLY in this format:
 ALERT: YES or NO
@@ -237,6 +246,7 @@ REASONING: Brief explanation"""
 
         # Log the tweet being analyzed
         logger.info(f'🔍 OLLAMA ANALYSIS START')
+        logger.info(f'🏷️  Tweet Source: {tweet_source}')
         logger.info(f'📝 Tweet Text: "{tweet_text}"')
         logger.info(f'🤖 Model: {OLLAMA_MODEL}')
         
@@ -298,37 +308,94 @@ REASONING: Brief explanation"""
         logger.error(f'❌ OLLAMA ANALYSIS ERROR: {e}')
         logger.info('🔄 Falling back to keyword analysis')
         logger.info(f'{"="*60}')
-        return await fallback_keyword_analysis(tweet_text)
+        return await fallback_keyword_analysis(tweet_text, tweet_source)
 
-async def fallback_keyword_analysis(tweet_text):
+async def fallback_keyword_analysis(tweet_text, tweet_source="Unknown"):
     """Fallback keyword analysis if Ollama fails"""
     try:
         text = tweet_text.lower()
+        
+        # Check for weekend trackwork patterns (should NOT alert)
+        weekend_trackwork_patterns = [
+            'this weekend',
+            'weekend trackwork',
+            'buses replace services',
+            'metro services do not run',
+            'planned trackwork',
+            'scheduled maintenance',
+            'weekend closure',
+            'weekend disruption'
+        ]
+        
+        # Check for Sydney Metro source (should NOT alert for T8 monitor)
+        sydney_metro_patterns = [
+            'sydney metro',
+            'sydneymetro',
+            'metro services',
+            'tallawong',
+            'sydenham'
+        ]
+        
+        # Check if this is weekend trackwork
+        is_weekend_trackwork = any(pattern in text for pattern in weekend_trackwork_patterns)
+        
+        # Check if this is Sydney Metro (wrong service line)
+        is_sydney_metro = any(pattern in text for pattern in sydney_metro_patterns) or 'sydneymetro' in tweet_source.lower()
+        
+        # Immediate disruption keywords
         delay_keywords = [
             'delay', 'disruption', 'cancelled', 'issue', 'suspended', 'stopped', 'problem',
             'extra travel time', 'allow extra', 'not running', 'service alert', 'altered',
             'incident', 'emergency', 'flooding', 'power supply', 'signal repairs', 
             'shuttle', 'reduced service', 'timetable order', 'longer journey', 'wait times',
-            'repairs', 'urgent', 'limited', 'diverted', 'gaps', 'less frequent', 'late',
-            'buses replace trains', 'replace trains', 'changed timetable', 'bus replacement',
-            'shuttle bus', 'buses replacing', 'replacement buses', 'timetable changes',
-            'service changes', 'amended timetable', 'modified timetable', 'trackwork'
+            'repairs', 'urgent', 'limited', 'diverted', 'gaps', 'less frequent', 'late'
+        ]
+        
+        # T8 specific keywords (higher priority)
+        t8_keywords = [
+            't8', 'airport line', 'airport train', 'green square', 'mascot', 'domestic airport',
+            'international airport', 'wolli creek', 'tempe', 'sydenham'
         ]
         
         has_delay_content = any(keyword in text for keyword in delay_keywords)
-        found_keywords = [k for k in delay_keywords if k in text]
-        reasoning = f"Keyword fallback - Found: {found_keywords}" if found_keywords else "No delay keywords found"
+        has_t8_content = any(keyword in text for keyword in t8_keywords)
+        found_delay_keywords = [k for k in delay_keywords if k in text]
+        found_t8_keywords = [k for k in t8_keywords if k in text]
+        
+        # Decision logic
+        should_alert = False
+        reasoning = ""
+        
+        if is_sydney_metro:
+            should_alert = False
+            reasoning = f"Sydney Metro tweet - not relevant for T8 Airport Line monitoring"
+        elif is_weekend_trackwork:
+            should_alert = False 
+            reasoning = f"Weekend trackwork announcement - planned maintenance, not immediate disruption"
+        elif has_delay_content and has_t8_content:
+            should_alert = True
+            reasoning = f"T8-specific disruption keywords found: {found_t8_keywords} + {found_delay_keywords}"
+        elif has_delay_content and not has_t8_content:
+            should_alert = False  # Conservative approach - need T8 context
+            reasoning = f"General disruption keywords but no T8 context: {found_delay_keywords}"
+        else:
+            should_alert = False
+            reasoning = "No relevant disruption keywords found"
         
         # Log fallback analysis
         logger.info(f'🔄 FALLBACK KEYWORD ANALYSIS:')
+        logger.info(f'🏷️  Tweet Source: {tweet_source}')
         logger.info(f'📝 Tweet Text: "{tweet_text}"')
-        logger.info(f'🔍 Keywords Found: {found_keywords}')
-        logger.info(f'📊 Alert Decision: {"YES" if has_delay_content else "NO"}')
+        logger.info(f'🔍 Delay Keywords: {found_delay_keywords}')
+        logger.info(f'🚆 T8 Keywords: {found_t8_keywords}')
+        logger.info(f'📅 Weekend Trackwork: {is_weekend_trackwork}')
+        logger.info(f'🚇 Sydney Metro: {is_sydney_metro}')
+        logger.info(f'📊 Alert Decision: {"YES" if should_alert else "NO"}')
         logger.info(f'💭 Reasoning: {reasoning}')
         logger.info(f'🔄 FALLBACK ANALYSIS END')
         logger.info(f'{"="*60}')
         
-        return has_delay_content, "MEDIUM", reasoning
+        return should_alert, "MEDIUM", reasoning
     except Exception as e:
         logger.error(f'❌ Error in fallback analysis: {e}')
         return False, "LOW", "Analysis failed"
@@ -390,8 +457,22 @@ async def process_tweet(tweet):
         logger.info(f'⏱️ Tweet Age: {str(time_diff).split(".")[0]}')
         logger.info(f'📝 Full Tweet Text: "{tweet.text}"')
         
+        # Determine tweet source for analysis - check for retweets
+        tweet_source = "T8SydneyTrains"  # Default assumption since we're fetching from T8 account
+        
+        # Check if this is a retweet of Sydney Metro content
+        if hasattr(tweet, 'referenced_tweets') and tweet.referenced_tweets:
+            for ref in tweet.referenced_tweets:
+                if ref.type == 'retweeted':
+                    logger.info(f'🔄 This is a retweet - original tweet type: {ref.type}')
+        
+        # Check tweet text for Sydney Metro indicators
+        if any(indicator in tweet.text.lower() for indicator in ['sydney metro', 'metro services', '@sydneymetro']):
+            tweet_source = "SydneyMetro (retweeted by T8SydneyTrains)"
+            logger.warning(f'⚠️  Detected Sydney Metro content in T8 feed: "{tweet.text[:100]}..."')
+        
         # Use Ollama AI to analyze the tweet
-        should_alert, confidence, reasoning = await analyze_tweet_with_ollama(tweet.text)
+        should_alert, confidence, reasoning = await analyze_tweet_with_ollama(tweet.text, tweet_source)
         
         # Determine if we should actually send alert based on monitoring window
         # Allow longer age limit for high confidence alerts (up to 4 hours)
@@ -620,8 +701,8 @@ async def fetch_tweets_twitterapi():
         since_str = last_checked_time.strftime("%Y-%m-%d_%H:%M:%S_UTC")
         until_str = current_time.strftime("%Y-%m-%d_%H:%M:%S_UTC")
         
-        # Construct the query (exact format from blog post)
-        query = f"from:T8SydneyTrains since:{since_str} until:{until_str} include:nativeretweets"
+        # Construct the query (exact format from blog post) - exclude retweets to avoid Sydney Metro content
+        query = f"from:T8SydneyTrains since:{since_str} until:{until_str} -is:retweet"
         
         # API endpoint (from blog post)
         url = "https://api.twitterapi.io/twitter/tweet/advanced_search"
