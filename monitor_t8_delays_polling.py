@@ -7,6 +7,15 @@ from telegram import Bot
 import dateutil.tz
 import ollama
 import aiohttp
+import requests
+import holidays
+from icalendar import Calendar
+from urllib.parse import urljoin
+import re
+from bs4 import BeautifulSoup
+from pathlib import Path
+import json
+from dateutil import parser as date_parser
 
 # Load environment variables from .env file if it exists
 def load_env_file():
@@ -23,6 +32,376 @@ def load_env_file():
 
 load_env_file()
 
+class SchoolDayChecker:
+    """
+    Determines if a given date is a school day in Sydney, NSW, Australia.
+    Dynamically fetches term dates from NSW Education Department.
+    """
+    
+    def __init__(self, cache_dir: str = ".school_day_cache"):
+        """
+        Initialize the School Day Checker.
+        
+        Args:
+            cache_dir: Directory to cache downloaded data
+        """
+        self.sydney_tz = dateutil.tz.gettz("Australia/Sydney")
+        self.cache_dir = Path(cache_dir)
+        self.cache_dir.mkdir(exist_ok=True)
+        
+        # Initialize NSW holidays
+        self.nsw_holidays = holidays.Australia(state='NSW')
+        
+        # Cache file paths
+        self.term_cache_file = self.cache_dir / "nsw_terms.json"
+        self.ics_cache_file = self.cache_dir / "nsw_school_calendar.ics"
+        
+        # NSW Education URLs
+        self.base_url = "https://education.nsw.gov.au"
+        self.calendar_url = urljoin(self.base_url, "/schooling/calendars/")
+        self.ics_pattern = r'/content/dam/main-education/public-schools/going-to-a-public-school/media/ics-files/\d{4}_Calendar\.ics'
+        
+        # Load term dates
+        self.term_dates = self._get_term_dates()
+        
+    def _get_current_year(self) -> int:
+        """Get current year in Sydney timezone."""
+        return datetime.now(self.sydney_tz).year
+    
+    def _download_ics_calendar(self, year: int):
+        """
+        Download the ICS calendar file from NSW Education website.
+        
+        Args:
+            year: Year to download calendar for
+            
+        Returns:
+            ICS calendar content as string, or None if failed
+        """
+        try:
+            # First, get the page for the specific year
+            year_url = urljoin(self.calendar_url, str(year))
+            response = requests.get(year_url, timeout=10)
+            response.raise_for_status()
+            
+            # Parse the HTML to find the ICS file link
+            soup = BeautifulSoup(response.text, 'html.parser')
+            
+            # Look for the ICS file link
+            ics_link = None
+            for link in soup.find_all('a', href=True):
+                if '.ics' in link['href'] and str(year) in link['href']:
+                    ics_link = link['href']
+                    break
+            
+            # If not found, try regex pattern
+            if not ics_link:
+                matches = re.findall(self.ics_pattern, response.text)
+                if matches:
+                    ics_link = matches[0]
+            
+            if ics_link:
+                # Download the ICS file
+                if not ics_link.startswith('http'):
+                    ics_link = urljoin(self.base_url, ics_link)
+                
+                ics_response = requests.get(ics_link, timeout=10)
+                ics_response.raise_for_status()
+                
+                # Cache the ICS file
+                with open(self.ics_cache_file, 'w') as f:
+                    f.write(ics_response.text)
+                
+                logger.info(f"Downloaded ICS calendar for {year}")
+                return ics_response.text
+                
+        except Exception as e:
+            logger.warning(f"Failed to download ICS calendar: {e}")
+            
+        return None
+    
+    def _parse_ics_calendar(self, ics_content: str):
+        """
+        Parse ICS calendar content to extract term dates and holidays.
+        
+        Args:
+            ics_content: ICS calendar content as string
+            
+        Returns:
+            Dictionary containing term dates and holidays
+        """
+        cal = Calendar.from_ical(ics_content)
+        term_data = {
+            'terms': {},
+            'holidays': [],
+            'development_days': []
+        }
+        
+        for component in cal.walk():
+            if component.name == "VEVENT":
+                summary = str(component.get('summary', '')).lower()
+                dtstart = component.get('dtstart')
+                dtend = component.get('dtend')
+                
+                if dtstart:
+                    start_date = dtstart.dt
+                    if isinstance(start_date, datetime):
+                        start_date = start_date.date()
+                    
+                    end_date = None
+                    if dtend:
+                        end_date = dtend.dt
+                        if isinstance(end_date, datetime):
+                            end_date = end_date.date()
+                    
+                    # Parse term information
+                    if 'term' in summary and any(num in summary for num in ['1', '2', '3', '4']):
+                        term_match = re.search(r'term\s*(\d)', summary)
+                        if term_match:
+                            term_num = int(term_match.group(1))
+                            
+                            if f'term{term_num}' not in term_data['terms']:
+                                term_data['terms'][f'term{term_num}'] = {}
+                            
+                            if 'start' in summary or 'first' in summary:
+                                term_data['terms'][f'term{term_num}']['start'] = start_date
+                            elif 'end' in summary or 'last' in summary:
+                                term_data['terms'][f'term{term_num}']['end'] = end_date or start_date
+                    
+                    # Parse school development days
+                    elif 'development' in summary or 'pupil free' in summary or 'staff' in summary:
+                        term_data['development_days'].append(start_date)
+                    
+                    # Parse holidays
+                    elif 'holiday' in summary or 'vacation' in summary:
+                        if end_date:
+                            term_data['holidays'].append((start_date, end_date))
+                        else:
+                            term_data['holidays'].append((start_date, start_date))
+        
+        return term_data
+    
+    def _scrape_term_dates(self, year: int):
+        """
+        Scrape term dates from NSW Education website as fallback.
+        
+        Args:
+            year: Year to scrape term dates for
+            
+        Returns:
+            Dictionary containing term dates, or None if failed
+        """
+        try:
+            url = urljoin(self.calendar_url, str(year))
+            response = requests.get(url, timeout=10)
+            response.raise_for_status()
+            
+            soup = BeautifulSoup(response.text, 'html.parser')
+            term_data = {
+                'terms': {},
+                'holidays': [],
+                'development_days': [],
+                'year': year
+            }
+            
+            # Look for term date patterns in the text
+            text = soup.get_text()
+            
+            # Pattern for term dates (e.g., "Term 1: Thursday 6 February to Friday 11 April")
+            term_pattern = r'Term\s+(\d):\s+\w+\s+(\d+\s+\w+)\s+to\s+\w+\s+(\d+\s+\w+)'
+            matches = re.findall(term_pattern, text)
+            
+            for match in matches:
+                term_num = int(match[0])
+                try:
+                    # Add year to date strings
+                    start_date = date_parser.parse(f"{match[1]} {year}").date()
+                    end_date = date_parser.parse(f"{match[2]} {year}").date()
+                    
+                    term_data['terms'][f'term{term_num}'] = {
+                        'start': start_date,
+                        'end': end_date
+                    }
+                except:
+                    continue
+            
+            if term_data['terms']:
+                logger.info(f"Scraped term dates for {year}")
+                return term_data
+                
+        except Exception as e:
+            logger.warning(f"Failed to scrape term dates: {e}")
+            
+        return None
+    
+    def _get_term_dates(self):
+        """
+        Get term dates, trying multiple methods in order of preference.
+        
+        Returns:
+            Dictionary containing term dates
+        """
+        current_year = self._get_current_year()
+        
+        # Check cache first
+        if self.term_cache_file.exists():
+            try:
+                with open(self.term_cache_file, 'r') as f:
+                    cached_data = json.load(f)
+                    
+                # Check if cache is for current year
+                if cached_data.get('year') == current_year:
+                    logger.info("Using cached term dates")
+                    # Convert string dates back to date objects
+                    for term_key in cached_data.get('terms', {}):
+                        for date_key in ['start', 'end']:
+                            if date_key in cached_data['terms'][term_key]:
+                                cached_data['terms'][term_key][date_key] = datetime.date.fromisoformat(
+                                    cached_data['terms'][term_key][date_key]
+                                )
+                    
+                    # Convert holiday tuples
+                    cached_data['holidays'] = [
+                        (datetime.date.fromisoformat(start), datetime.date.fromisoformat(end))
+                        for start, end in cached_data.get('holidays', [])
+                    ]
+                    
+                    # Convert development days
+                    cached_data['development_days'] = [
+                        datetime.date.fromisoformat(day)
+                        for day in cached_data.get('development_days', [])
+                    ]
+                    
+                    return cached_data
+            except Exception as e:
+                logger.warning(f"Failed to load cache: {e}")
+        
+        # Try to download and parse ICS calendar
+        ics_content = self._download_ics_calendar(current_year)
+        if ics_content:
+            term_data = self._parse_ics_calendar(ics_content)
+            if term_data['terms']:
+                term_data['year'] = current_year
+                self._save_cache(term_data)
+                return term_data
+        
+        # Fallback to web scraping
+        term_data = self._scrape_term_dates(current_year)
+        if term_data:
+            self._save_cache(term_data)
+            return term_data
+        
+        # If all else fails, use fallback dates (current hardcoded dates as backup)
+        logger.warning("Could not retrieve term dates from any source, using fallback dates")
+        return {
+            'terms': {
+                'term1': {'start': datetime.date(2025, 2, 4), 'end': datetime.date(2025, 4, 11)},
+                'term2': {'start': datetime.date(2025, 4, 29), 'end': datetime.date(2025, 7, 4)},
+                'term3': {'start': datetime.date(2025, 7, 22), 'end': datetime.date(2025, 9, 26)},
+                'term4': {'start': datetime.date(2025, 10, 13), 'end': datetime.date(2025, 12, 19)}
+            },
+            'holidays': [],
+            'development_days': [],
+            'year': current_year
+        }
+    
+    def _save_cache(self, term_data):
+        """Save term data to cache file."""
+        try:
+            # Convert date objects to strings for JSON serialization
+            cache_data = {
+                'year': term_data.get('year'),
+                'terms': {},
+                'holidays': [],
+                'development_days': []
+            }
+            
+            # Convert term dates
+            for term_key, dates in term_data.get('terms', {}).items():
+                cache_data['terms'][term_key] = {}
+                for date_key in ['start', 'end']:
+                    if date_key in dates:
+                        cache_data['terms'][term_key][date_key] = dates[date_key].isoformat()
+            
+            # Convert holidays
+            cache_data['holidays'] = [
+                (start.isoformat(), end.isoformat())
+                for start, end in term_data.get('holidays', [])
+            ]
+            
+            # Convert development days
+            cache_data['development_days'] = [
+                day.isoformat() for day in term_data.get('development_days', [])
+            ]
+            
+            with open(self.term_cache_file, 'w') as f:
+                json.dump(cache_data, f, indent=2)
+            
+            logger.info("Cached term dates")
+        except Exception as e:
+            logger.warning(f"Failed to save cache: {e}")
+    
+    def is_weekend(self, date: datetime.date) -> bool:
+        """Check if date is a weekend."""
+        return date.weekday() >= 5  # Saturday = 5, Sunday = 6
+    
+    def is_public_holiday(self, date: datetime.date) -> bool:
+        """Check if date is a public holiday in NSW."""
+        return date in self.nsw_holidays
+    
+    def is_school_holiday(self, date: datetime.date) -> bool:
+        """Check if date falls during school holidays."""
+        for start, end in self.term_dates.get('holidays', []):
+            if start <= date <= end:
+                return True
+        return False
+    
+    def is_development_day(self, date: datetime.date) -> bool:
+        """Check if date is a school development day (pupil-free day)."""
+        return date in self.term_dates.get('development_days', [])
+    
+    def is_during_term(self, date: datetime.date) -> bool:
+        """Check if date falls within any school term."""
+        for term_key, dates in self.term_dates.get('terms', {}).items():
+            if 'start' in dates and 'end' in dates:
+                if dates['start'] <= date <= dates['end']:
+                    return True
+        return False
+    
+    def is_school_day(self, date=None) -> bool:
+        """
+        Determine if a given date is a school day in Sydney.
+        
+        Args:
+            date: Date to check. If None, uses today in Sydney timezone.
+            
+        Returns:
+            True if it's a school day, False otherwise
+        """
+        if date is None:
+            date = datetime.now(self.sydney_tz).date()
+        elif hasattr(date, 'date'):  # Handle datetime objects
+            date = date.date()
+        
+        # Check conditions in order
+        if self.is_weekend(date):
+            return False
+        
+        if self.is_public_holiday(date):
+            return False
+        
+        if self.is_school_holiday(date):
+            return False
+        
+        if self.is_development_day(date):
+            return False
+        
+        if not self.is_during_term(date):
+            return False
+        
+        # If all checks pass, it's a school day
+        return True
+
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
@@ -38,6 +417,14 @@ if os.getenv('DEBUG', '').lower() in ['true', '1', 'yes']:
     logging.getLogger('urllib3').setLevel(logging.INFO)  # Reduce HTTP noise
     logging.getLogger('aiohttp').setLevel(logging.INFO)  # Reduce HTTP noise
 logger = logging.getLogger(__name__)
+
+# Initialize the school day checker
+try:
+    school_day_checker = SchoolDayChecker()
+    logger.info("✅ SchoolDayChecker initialized successfully")
+except Exception as e:
+    logger.error(f"❌ Failed to initialize SchoolDayChecker: {e}")
+    school_day_checker = None
 
 # Configuration from environment variables
 X_BEARER_TOKEN = os.getenv('X_BEARER_TOKEN')
@@ -118,31 +505,26 @@ else:
     else:
         logger.info(f'🔄 Custom interval: ~{estimated_calls} API calls per month')
 
-school_terms = [
-    (datetime(2025, 2, 4), datetime(2025, 4, 11)),
-    (datetime(2025, 4, 29), datetime(2025, 7, 4)),
-    (datetime(2025, 7, 22), datetime(2025, 9, 26)),
-    (datetime(2025, 10, 13), datetime(2025, 12, 19))
-]
-
-public_holidays = [
-    datetime(2025, 1, 1), datetime(2025, 1, 27), datetime(2025, 4, 18),
-    datetime(2025, 4, 21), datetime(2025, 4, 25), datetime(2025, 6, 9),
-    datetime(2025, 10, 6), datetime(2025, 12, 25), datetime(2025, 12, 26)
-]
+# Hardcoded arrays removed - now using dynamic SchoolDayChecker
 
 LAST_TWEET_FILE = 'last_tweet_id.txt'
 LAST_CHECK_FILE = 'last_check_time.txt'
 
 def is_sydney_school_day(check_date):
-    if check_date.weekday() >= 5:
-        return False
-    if check_date.date() in [h.date() for h in public_holidays]:
-        return False
-    for start, end in school_terms:
-        if start.date() <= check_date.date() <= end.date():
-            return True
-    return False
+    """
+    Check if a given date is a Sydney school day using the dynamic SchoolDayChecker.
+    Falls back to basic weekend check if SchoolDayChecker is unavailable.
+    """
+    try:
+        if school_day_checker:
+            return school_day_checker.is_school_day(check_date)
+        else:
+            # Fallback to basic weekend check if SchoolDayChecker failed to initialize
+            logger.warning("SchoolDayChecker unavailable, using basic weekend check")
+            return check_date.weekday() < 5  # Monday = 0, Friday = 4
+    except Exception as e:
+        logger.warning(f"Error checking school day: {e}, falling back to weekend check")
+        return check_date.weekday() < 5
 
 def is_within_time_window(check_time):
     aest = dateutil.tz.gettz('Australia/Sydney')
