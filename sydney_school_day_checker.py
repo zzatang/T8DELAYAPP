@@ -6,6 +6,7 @@ without hardcoding school term dates.
 """
 
 import datetime
+from datetime import timedelta
 import requests
 import holidays
 from icalendar import Calendar
@@ -129,6 +130,9 @@ class SchoolDayChecker:
             'development_days': []
         }
         
+        # Track term weeks to calculate start/end dates
+        term_weeks = {}
+        
         for component in cal.walk():
             if component.name == "VEVENT":
                 summary = str(component.get('summary', '')).lower()
@@ -146,30 +150,45 @@ class SchoolDayChecker:
                         if isinstance(end_date, datetime.datetime):
                             end_date = end_date.date()
                     
-                    # Parse term information
-                    if 'term' in summary and any(num in summary for num in ['1', '2', '3', '4']):
-                        term_match = re.search(r'term\s*(\d)', summary)
-                        if term_match:
-                            term_num = int(term_match.group(1))
-                            
-                            if f'term{term_num}' not in term_data['terms']:
-                                term_data['terms'][f'term{term_num}'] = {}
-                            
-                            if 'start' in summary or 'first' in summary:
-                                term_data['terms'][f'term{term_num}']['start'] = start_date
-                            elif 'end' in summary or 'last' in summary:
-                                term_data['terms'][f'term{term_num}']['end'] = end_date or start_date
+                    # Parse term week information (e.g., "Term 3 Week 1 (10 Wk Term)")
+                    term_week_match = re.search(r'term\s*(\d+)\s*week\s*(\d+)', summary)
+                    if term_week_match:
+                        term_num = int(term_week_match.group(1))
+                        week_num = int(term_week_match.group(2))
+                        
+                        if term_num not in term_weeks:
+                            term_weeks[term_num] = {}
+                        
+                        term_weeks[term_num][week_num] = start_date
                     
                     # Parse school development days
                     elif 'development' in summary or 'pupil free' in summary or 'staff' in summary:
                         term_data['development_days'].append(start_date)
                     
-                    # Parse holidays
+                    # Parse holidays - look for "School Holidays" or similar
                     elif 'holiday' in summary or 'vacation' in summary:
                         if end_date:
                             term_data['holidays'].append((start_date, end_date))
                         else:
                             term_data['holidays'].append((start_date, start_date))
+        
+        # Calculate term start and end dates from week data
+        for term_num, weeks in term_weeks.items():
+            if weeks:  # If we have week data for this term
+                min_week = min(weeks.keys())
+                max_week = max(weeks.keys())
+                
+                if min_week in weeks and max_week in weeks:
+                    # Term starts on the first day of Week 1
+                    term_start = weeks[min_week]
+                    
+                    # Term ends on the last day of the last week (add 6 days for full week)
+                    term_end = weeks[max_week] + timedelta(days=6)
+                    
+                    term_data['terms'][f'term{term_num}'] = {
+                        'start': term_start,
+                        'end': term_end
+                    }
         
         return term_data
     
@@ -506,6 +525,7 @@ def main():
                 print("  • School Development Day (Pupil-Free)")
             if not status['is_during_term'] and not status['is_school_holiday']:
                 print("  • Outside School Term")
+        
         
         if 'current_term' in status:
             print(f"\n📚 Current Term: {status['current_term']}")
