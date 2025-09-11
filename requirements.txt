@@ -6,4 +6,5 @@ aiohttp>=3.8.0
 requests>=2.25.0
 holidays>=0.34
 icalendar>=5.0.0
-beautifulsoup4>=4.9.0 
+beautifulsoup4>=4.9.0
+psycopg2-binary>=2.9.0 
