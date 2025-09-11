@@ -1,6 +1,6 @@
 ## Relevant Files
 
-- `school_calendar_generator.py` - Core calendar generation logic that downloads, parses, and generates school day data for the entire year
+- `school_calendar_generator.py` - Core calendar generation logic that downloads, parses, and generates school day data for the entire year (CREATED)
 - `school_day_lookup.py` - Fast PostgreSQL-based school day lookup class with O(1) performance and memory caching
 - `database/schema.sql` - PostgreSQL database schema with optimized indexes for school calendar table (CREATED)
 - `database/migrations.py` - Database migration utilities for schema setup and updates (CREATED)
@@ -31,14 +31,14 @@
   - [x] 1.4 Implement database connection handling with environment variable configuration
   - [x] 1.5 Add connection pooling and error handling for database operations
   - [x] 1.6 Create database health check and initialization functions
-- [ ] 2.0 Build Core Calendar Generation System
-  - [ ] 2.1 Create school_calendar_generator.py with base CalendarGenerator class
-  - [ ] 2.2 Implement NSW Education ICS file download and parsing logic (reuse from existing SchoolDayChecker)
-  - [ ] 2.3 Add web scraping fallback for when ICS download fails
-  - [ ] 2.4 Implement year-long calendar data generation (365/366 days with all metadata)
-  - [ ] 2.5 Add data validation and consistency checks for generated calendar data
-  - [ ] 2.6 Implement atomic PostgreSQL batch insert operations for calendar data
-  - [ ] 2.7 Add comprehensive logging for generation process and performance metrics
+- [x] 2.0 Build Core Calendar Generation System
+  - [x] 2.1 Create school_calendar_generator.py with base CalendarGenerator class
+  - [x] 2.2 Implement NSW Education ICS file download and parsing logic (reuse from existing SchoolDayChecker)
+  - [x] 2.3 Add web scraping fallback for when ICS download fails
+  - [x] 2.4 Implement year-long calendar data generation (365/366 days with all metadata)
+  - [x] 2.5 Add data validation and consistency checks for generated calendar data
+  - [x] 2.6 Implement atomic PostgreSQL batch insert operations for calendar data
+  - [x] 2.7 Add comprehensive logging for generation process and performance metrics
 - [ ] 3.0 Implement Fast School Day Lookup System
   - [ ] 3.1 Create school_day_lookup.py with SchoolDayLookup class
   - [ ] 3.2 Implement PostgreSQL-based date lookup with prepared statements
