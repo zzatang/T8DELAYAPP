@@ -38,11 +38,11 @@ class DatabaseMigrator:
     def _get_connection_params(self) -> Dict[str, Any]:
         """Get database connection parameters from environment variables."""
         return {
-            'host': os.getenv('DB_HOST', 'localhost'),
+            'host': os.getenv('DB_HOST', '192.168.68.55'),
             'port': int(os.getenv('DB_PORT', '5432')),
-            'database': os.getenv('DB_NAME', os.getenv('POSTGRES_DB', 'school_calendar')),
-            'user': os.getenv('DB_USER', os.getenv('POSTGRES_USER', 'postgres')),
-            'password': os.getenv('DB_PASSWORD', os.getenv('POSTGRES_PASSWORD', ''))
+            'database': os.getenv('DB_NAME', os.getenv('POSTGRES_DB', 'aidb')),
+            'user': os.getenv('DB_USER', os.getenv('POSTGRES_USER', 'aiuser')),
+            'password': os.getenv('DB_PASSWORD', os.getenv('POSTGRES_PASSWORD', 'aipass'))
         }
     
     def get_connection(self) -> psycopg2.extensions.connection:
@@ -75,8 +75,12 @@ class DatabaseMigrator:
                 with conn.cursor() as cur:
                     cur.execute("SELECT 1")
                     result = cur.fetchone()
-                    logger.info("✅ Database connection successful")
-                    return result[0] == 1
+                    if result and result[0] == 1:
+                        logger.info("✅ Database connection successful")
+                        return True
+                    else:
+                        logger.error(f"❌ Database connection failed: unexpected result {result}")
+                        return False
         except Exception as e:
             logger.error(f"❌ Database connection failed: {e}")
             return False

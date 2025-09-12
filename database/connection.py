@@ -23,11 +23,11 @@ class DatabaseConfig:
     
     def __init__(self):
         """Initialize database configuration from environment variables."""
-        self.host = os.getenv('DB_HOST', 'localhost')
+        self.host = os.getenv('DB_HOST', '192.168.68.55')
         self.port = int(os.getenv('DB_PORT', '5432'))
-        self.database = os.getenv('DB_NAME', os.getenv('POSTGRES_DB', 'school_calendar'))
-        self.user = os.getenv('DB_USER', os.getenv('POSTGRES_USER', 'postgres'))
-        self.password = os.getenv('DB_PASSWORD', os.getenv('POSTGRES_PASSWORD', ''))
+        self.database = os.getenv('DB_NAME', os.getenv('POSTGRES_DB', 'aidb'))
+        self.user = os.getenv('DB_USER', os.getenv('POSTGRES_USER', 'aiuser'))
+        self.password = os.getenv('DB_PASSWORD', os.getenv('POSTGRES_PASSWORD', 'aipass'))
         
         # Connection pool settings
         self.min_connections = int(os.getenv('DB_MIN_CONNECTIONS', '2'))

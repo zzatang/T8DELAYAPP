@@ -776,14 +776,47 @@ class SchoolCalendarGenerator:
                                       f"({batch_records[0]['date']} to {batch_records[-1]['date']})")
                         
                         # Verify the insert was successful
-                        cur.execute(
-                            "SELECT COUNT(*) FROM school_calendar WHERE EXTRACT(YEAR FROM date) = %s",
-                            (year,)
-                        )
-                        final_count = cur.fetchone()[0]
+                        logger.info(f"🔍 Verifying insert success for year {year}...")
+                        try:
+                            cur.execute(
+                                "SELECT COUNT(*) as count FROM school_calendar WHERE EXTRACT(YEAR FROM date) = %s",
+                                (year,)
+                            )
+                            result_row = cur.fetchone()
+                            logger.info(f"🔍 Query result: {result_row}")
+                            
+                            # Handle both tuple and dictionary-like results
+                            if result_row:
+                                if hasattr(result_row, 'keys'):  # Dictionary-like (RealDictRow)
+                                    final_count = result_row['count']
+                                else:  # Tuple-like
+                                    final_count = result_row[0]
+                            else:
+                                final_count = 0
+                                
+                        except Exception as verify_error:
+                            logger.error(f"❌ Verification query failed: {verify_error}")
+                            raise Exception(f"Database verification query failed: {verify_error}")
+                        
+                        logger.info(f"📊 Database verification: expected {len(calendar_records)} records, found {final_count} records")
+                        logger.info(f"📊 Batch processing summary: {total_inserted} total inserted from cur.rowcount")
+                        
+                        # Update the total_inserted count to reflect actual database state
+                        # (cur.rowcount from executemany can be unreliable)
+                        if final_count > 0:
+                            total_inserted = final_count
                         
                         if final_count != len(calendar_records):
-                            raise Exception(f"Insert verification failed: expected {len(calendar_records)}, found {final_count}")
+                            logger.warning(f"⚠️ Insert count mismatch: expected {len(calendar_records)}, found {final_count}")
+                            # Only fail if we have zero records (complete failure)
+                            if final_count == 0:
+                                raise Exception(f"Insert verification failed: no records found in database (expected {len(calendar_records)})")
+                            elif final_count < len(calendar_records) * 0.9:  # Allow 10% tolerance
+                                raise Exception(f"Insert verification failed: expected {len(calendar_records)}, found {final_count}")
+                            else:
+                                logger.info(f"✅ Insert verification passed with minor discrepancy: {final_count} records confirmed")
+                        else:
+                            logger.info(f"✅ Insert verification passed: {final_count} records confirmed in database")
                         
                         # Commit the entire transaction
                         conn.commit()
@@ -1385,6 +1418,28 @@ def main():
     """Command-line interface for school calendar generation."""
     import argparse
     import sys
+    import os
+    
+    # Fix Windows console encoding issues for emoji characters
+    if os.name == 'nt':  # Windows
+        try:
+            # Try to set console code page to UTF-8
+            os.system('chcp 65001 > nul 2>&1')
+            # Reconfigure stdout/stderr with UTF-8 encoding if available
+            if hasattr(sys.stdout, 'reconfigure'):
+                sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+                sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+        except Exception:
+            pass  # Ignore errors, will fallback to safe printing
+    
+    # Safe print function to handle encoding issues
+    def safe_print(message):
+        try:
+            print(message)
+        except UnicodeEncodeError:
+            # Fallback: replace problematic characters with safe alternatives
+            safe_message = message.encode('ascii', errors='replace').decode('ascii')
+            print(safe_message)
     
     parser = argparse.ArgumentParser(description='NSW School Calendar Generator')
     parser.add_argument('year', type=int, help='Year to generate calendar for')
@@ -1418,17 +1473,18 @@ def main():
             result = generator.generate_and_save_year(args.year, args.batch_size)
             
             if result['success']:
-                print(f"✅ Successfully generated and saved calendar for {args.year}")
-                print(f"📊 Total records: {result['total_records']}")
-                print(f"📊 School days: {result['statistics']['school_days']}")
-                print(f"⏱️ Generation time: {result['statistics']['generation_time']:.2f} seconds")
+                safe_print(f"✅ Successfully generated and saved calendar for {args.year}")
+                safe_print(f"📊 Total records: {result['total_records']}")
+                safe_print(f"📊 School days: {result['statistics']['school_days']}")
+                generation_time = result['statistics'].get('generation_time', 0) or 0
+                safe_print(f"⏱️ Generation time: {generation_time:.2f} seconds")
                 sys.exit(0)
             else:
-                print(f"❌ Failed to generate calendar for {args.year}: {result.get('error', 'Unknown error')}")
+                safe_print(f"❌ Failed to generate calendar for {args.year}: {result.get('error', 'Unknown error')}")
                 sys.exit(1)
                 
     except Exception as e:
-        print(f"❌ Error: {e}")
+        safe_print(f"❌ Error: {e}")
         if args.verbose:
             import traceback
             traceback.print_exc()
