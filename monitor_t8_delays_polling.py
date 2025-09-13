@@ -8,7 +8,6 @@ import dateutil.tz
 import ollama
 import aiohttp
 import requests
-from school_day_lookup import SchoolDayLookup
 
 # Load environment variables from .env file if it exists
 def load_env_file():
@@ -29,14 +28,18 @@ load_env_file()
 # This provides database-backed, high-performance school day lookups
 
 # Removed SchoolDayChecker class - replaced with SchoolDayLookup system
+# CRITICAL: Set up logging BEFORE importing modules that use logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler('t8_monitor.log'),
+        logging.FileHandler('t8_monitor.log', encoding='utf-8'),
         logging.StreamHandler()
     ]
 )
+
+# Now import modules that use logging - they will inherit the configuration
+from school_day_lookup import SchoolDayLookup
 
 # Enable debug logging if DEBUG environment variable is set
 if os.getenv('DEBUG', '').lower() in ['true', '1', 'yes']:
@@ -44,6 +47,27 @@ if os.getenv('DEBUG', '').lower() in ['true', '1', 'yes']:
     logging.getLogger('urllib3').setLevel(logging.INFO)  # Reduce HTTP noise
     logging.getLogger('aiohttp').setLevel(logging.INFO)  # Reduce HTTP noise
 logger = logging.getLogger(__name__)
+
+# Force unbuffered output for logging to prevent log file not updating
+import sys
+try:
+    sys.stdout.reconfigure(line_buffering=True)
+    sys.stderr.reconfigure(line_buffering=True)
+except AttributeError:
+    # reconfigure is not available in older Python versions
+    pass
+
+# Ensure file handler flushes immediately
+for handler in logging.getLogger().handlers:
+    if isinstance(handler, logging.FileHandler):
+        handler.flush()
+
+# Add periodic flushing function to call after log writes
+def flush_logs():
+    """Force flush all log handlers to ensure immediate write to disk"""
+    for handler in logging.getLogger().handlers:
+        if hasattr(handler, 'flush'):
+            handler.flush()
 
 # Initialize the school day lookup system with comprehensive validation
 def initialize_school_day_system():
@@ -159,6 +183,7 @@ def initialize_school_day_system():
             logger.info("🛡️ Manual calendar management will be required")
         
         logger.info("✅ School Day Lookup System fully initialized and validated")
+        flush_logs()  # Ensure initialization logs are written
         return lookup_system, True
         
     except ImportError as e:
@@ -1615,6 +1640,7 @@ async def log_heartbeat():
     try:
         # Basic heartbeat
         logger.info("💓 T8 Monitor heartbeat - system running normally")
+        flush_logs()  # Ensure heartbeat is written immediately
         
         # Enhanced database status reporting during heartbeat
         if school_day_lookup:
@@ -1830,6 +1856,7 @@ async def startup_validation():
 
 async def main():
     logger.info('🚀 Starting T8 Delays Monitor with Ollama AI Analysis...')
+    flush_logs()  # Ensure startup message is written
     
     # Comprehensive startup validation
     if not await startup_validation():
@@ -1904,6 +1931,7 @@ async def main():
     else:
         logger.info(f'🔧 Active API: X API (Traditional Twitter API)')
     logger.info(f'Monitoring mode: Polling every {POLLING_INTERVAL_MINUTES} minutes during school days and peak hours')
+    flush_logs()  # Ensure all startup info is written
     
     heartbeat_counter = 0
     
@@ -1933,6 +1961,7 @@ async def main():
                     except Exception as e:
                         error_type = type(e).__name__
                         logger.error(f"❌ Twitter API error ({error_type}): {e}")
+                        flush_logs()  # Ensure error is written immediately
                         
                         # Provide specific guidance based on error type
                         if "timeout" in str(e).lower():

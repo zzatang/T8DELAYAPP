@@ -2045,6 +2045,7 @@ def create_school_day_checker(cache_dir: str = "~/.school_day_cache") -> SchoolD
 
 if __name__ == "__main__":
     # Example usage and testing
+    # Only configure logging when running as main script, not when imported
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
     
     print("🚀 School Day Lookup System Test")
