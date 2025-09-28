@@ -1304,9 +1304,17 @@ async def fetch_tweets_twitterapi():
     """
     try:
         # Load last check time (blog post approach)
-        last_checked_time = load_last_check_time()
+        raw_last_checked_time = load_last_check_time()
         current_time = datetime.now(dateutil.tz.UTC)
-        
+
+        # Clamp the lookback window to match X API behaviour
+        lookback_hours = max(2, POLLING_INTERVAL_MINUTES // 30 + 1)
+        earliest_allowed = current_time - timedelta(hours=lookback_hours)
+        last_checked_time = max(raw_last_checked_time, earliest_allowed)
+
+        if last_checked_time != raw_last_checked_time:
+            logger.debug(f"Clamped TwitterAPI.io lookback start: {raw_last_checked_time.isoformat()} -> {last_checked_time.isoformat()}")
+
         # Format times as strings in the format Twitter's API expects (from blog)
         since_str = last_checked_time.strftime("%Y-%m-%d_%H:%M:%S_UTC")
         until_str = current_time.strftime("%Y-%m-%d_%H:%M:%S_UTC")
