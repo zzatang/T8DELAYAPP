@@ -816,6 +816,7 @@ CRITICAL FILTERING RULES:
 2. IGNORE tweets from Sydney Metro (@SydneyMetro) - these are about metro services, not T8 trains
 3. ONLY alert for IMMEDIATE/CURRENT disruptions, NOT future/scheduled events
 4. IGNORE weekend trackwork announcements (these are planned maintenance)
+5. If a tweet says a change starts FROM a future date (e.g. "From Sun 19 October...") or mentions timetable changes effective at a later date, treat it as scheduled information and respond NO alert.
 
 Analyze this tweet and determine if it indicates IMMEDIATE/CURRENT T8 Airport Line disruptions requiring urgent passenger action:
 - Service delays, disruptions, or cancellations happening NOW on T8 line
@@ -843,6 +844,7 @@ NOT alert-worthy (IGNORE these):
 - "From [time] to [time], trains may run to a changed timetable"
 - Scheduled trackwork announcements for future dates or weekends
 - "Due to trackwork between [stations]" for future dates
+- "From [future date], services will run to a changed timetable" (future timetable change)
 - Weekend trackwork between stations (planned maintenance)
 - Trackwork scheduled outside school hours (Monday to Friday, 7am to 4pm)
 - Any announcement asking about future travel with planned disruptions
