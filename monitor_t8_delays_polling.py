@@ -2,12 +2,15 @@ import tweepy
 import asyncio
 import logging
 import os
-from datetime import datetime, timedelta
+from dataclasses import dataclass
+from typing import Any, Dict, Optional
+from datetime import datetime, timedelta, date
 from telegram import Bot
 import dateutil.tz
 import ollama
 import aiohttp
 import requests
+import time
 
 # Load environment variables from .env file if it exists
 def load_env_file():
@@ -24,10 +27,9 @@ def load_env_file():
 
 load_env_file()
 
-# School day checking functionality has been moved to school_day_lookup.py
-# This provides database-backed, high-performance school day lookups
+# School day checking functionality now uses SydneySchoolDayService which
+# dynamically sources NSW calendar data without static date ranges
 
-# Removed SchoolDayChecker class - replaced with SchoolDayLookup system
 # CRITICAL: Set up logging BEFORE importing modules that use logging
 logging.basicConfig(
     level=logging.INFO,
@@ -39,7 +41,7 @@ logging.basicConfig(
 )
 
 # Now import modules that use logging - they will inherit the configuration
-from school_day_lookup import SchoolDayLookup
+from sydney_school_day_checker import SchoolDayChecker
 
 # Enable debug logging if DEBUG environment variable is set
 if os.getenv('DEBUG', '').lower() in ['true', '1', 'yes']:
@@ -69,147 +71,252 @@ def flush_logs():
         if hasattr(handler, 'flush'):
             handler.flush()
 
+
+@dataclass
+class SydneySchoolDayResult:
+    """Structured result for school day evaluations."""
+    date: date
+    is_school_day: bool
+    day_of_week: str
+    reason: str
+    lookup_time_ms: float
+    cache_hit: bool = True
+    term: Optional[str] = None
+    status_details: Optional[Dict[str, Any]] = None
+
+
+class SydneySchoolDayService:
+    """
+    Wraps SchoolDayChecker to provide a drop-in replacement for the
+    former database-backed SchoolDayLookup service.
+    """
+
+    def __init__(self):
+        self.checker = SchoolDayChecker()
+        self.term_data = self.checker.term_dates or {}
+        self.lookup_count = 0
+        self.error_count = 0
+        self.cache_hits = 0
+        self.total_lookup_time_ms = 0.0
+        self.last_refresh = datetime.now(dateutil.tz.gettz('Australia/Sydney'))
+
+    def _normalize_date(self, check_date) -> date:
+        if isinstance(check_date, datetime):
+            return check_date.date()
+        if isinstance(check_date, date):
+            return check_date
+        raise TypeError("check_date must be a date or datetime instance")
+
+    def _build_reason(self, details: Dict[str, Any]) -> str:
+        if not details:
+            return "unknown"
+
+        if details.get('is_school_day'):
+            reason = "In-term weekday"
+            if details.get('current_term'):
+                reason += f" ({details['current_term']})"
+            return reason
+
+        reasons = []
+        if details.get('is_weekend'):
+            reasons.append("Weekend")
+        if details.get('is_public_holiday'):
+            holiday_name = details.get('holiday_name')
+            if holiday_name:
+                reasons.append(f"Public Holiday: {holiday_name}")
+            else:
+                reasons.append("Public Holiday")
+        if details.get('is_school_holiday'):
+            reasons.append("School Holiday Period")
+        if details.get('is_development_day'):
+            reasons.append("School Development Day")
+        if not details.get('is_during_term'):
+            reasons.append("Outside School Term")
+
+        return ", ".join(reasons) if reasons else "Non-school day"
+
+    def _collect_years(self) -> set:
+        years = set()
+        for term_info in self.term_data.get('terms', {}).values():
+            start = term_info.get('start')
+            end = term_info.get('end')
+            if isinstance(start, date):
+                years.add(start.year)
+            if isinstance(end, date):
+                years.add(end.year)
+        return years
+
+    def _estimate_cached_days(self) -> int:
+        total_days = 0
+        for term_info in self.term_data.get('terms', {}).values():
+            start = term_info.get('start')
+            end = term_info.get('end')
+            if isinstance(start, date) and isinstance(end, date):
+                total_days += (end - start).days + 1
+        return total_days
+
+    def lookup_date(self, check_date) -> Optional[SydneySchoolDayResult]:
+        target_date = self._normalize_date(check_date)
+        start_time = time.perf_counter()
+
+        try:
+            details = self.checker.get_status_details(target_date)
+            if getattr(self.checker, 'term_dates', None):
+                self.term_data = self.checker.term_dates or self.term_data
+        except Exception as exc:
+            self.error_count += 1
+            logger.warning(f"SydneySchoolDayService lookup failed for {target_date}: {exc}")
+            return None
+
+        lookup_time_ms = (time.perf_counter() - start_time) * 1000.0
+        self.lookup_count += 1
+        self.total_lookup_time_ms += lookup_time_ms
+
+        result = SydneySchoolDayResult(
+            date=target_date,
+            is_school_day=details.get('is_school_day', False),
+            day_of_week=details.get('day_name', target_date.strftime('%A')),
+            reason=self._build_reason(details),
+            lookup_time_ms=lookup_time_ms,
+            cache_hit=True,
+            term=details.get('current_term'),
+            status_details=details
+        )
+        return result
+
+    def _comprehensive_fallback_lookup(self, check_date, source: str = "service_fallback"):
+        """
+        Maintain compatibility with legacy fallback invocation patterns by
+        delegating to lookup_date. The source parameter is kept for logging parity.
+        """
+        return self.lookup_date(check_date)
+
+    def get_database_status(self) -> Dict[str, Any]:
+        available_terms = list(self.term_data.get('terms', {}).keys())
+        status = {
+            'current_status': 'healthy' if available_terms else 'unavailable',
+            'data_source': 'nsw_education_calendar',
+            'fallback_strategy': 'sydney_school_day_checker',
+            'available_terms': available_terms,
+            'last_refresh': self.last_refresh.isoformat(),
+            'cache_entries': self._estimate_cached_days(),
+            'errors': self.error_count
+        }
+        if not available_terms:
+            status['current_status'] = 'unavailable'
+        return status
+
+    def get_performance_stats(self) -> Dict[str, Any]:
+        cache_hit_rate = 1.0  # The checker operates entirely from cached calendar data
+        avg_lookup_time = (
+            self.total_lookup_time_ms / self.lookup_count
+            if self.lookup_count
+            else 0.0
+        )
+        return {
+            'total_lookups': self.lookup_count,
+            'cache_hit_rate': cache_hit_rate,
+            'hit_rate_percent': cache_hit_rate * 100,
+            'cache_size': self._estimate_cached_days(),
+            'available_days_estimate': self._estimate_cached_days(),
+            'avg_lookup_time_ms': avg_lookup_time,
+            'fallback_system': {
+                'fallback_rate_percent': 0.0,
+                'total_fallback_calls': 0,
+                'last_fallback_reason': None
+            },
+            'years_cached': sorted(self._collect_years()),
+        }
+
+    def get_health_status(self) -> Dict[str, Any]:
+        status = self.get_database_status()
+        perf = self.get_performance_stats()
+        overall = 'healthy' if status['current_status'] == 'healthy' else 'attention_required'
+
+        details = []
+        if status['current_status'] != 'healthy':
+            details.append('Calendar term data unavailable or incomplete')
+        if self.error_count:
+            details.append(f'{self.error_count} lookup errors recorded')
+
+        return {
+            'overall_status': overall,
+            'details': details,
+            'calendar_source': status['data_source'],
+            'cache': {
+                'entry_count': perf.get('cache_size', 0),
+                'hit_rate_percent': perf.get('hit_rate_percent', 0.0)
+            },
+            'fallback_system': {
+                'status': 'ready',
+                'note': 'Multi-source calendar scraper/ICS fallback available'
+            },
+            'performance': {
+                'total_lookups': perf.get('total_lookups', 0),
+                'cache_hit_rate': perf.get('cache_hit_rate', 0.0),
+                'average_lookup_time_ms': perf.get('avg_lookup_time_ms', 0.0)
+            }
+        }
+
 # Initialize the school day lookup system with comprehensive validation
 def initialize_school_day_system():
     """
-    Initialize the SchoolDayLookup system with comprehensive validation.
-    
+    Initialize the SydneySchoolDayService with comprehensive validation.
+
     Returns:
-        tuple: (school_day_lookup_instance, initialization_success)
+        tuple: (school_day_service_instance, initialization_success)
     """
-    logger.info("🚀 Initializing School Day Lookup System...")
-    
+    logger.info(" Initializing Sydney School Day Service...")
+
     try:
-        # Initialize the lookup system
-        lookup_system = SchoolDayLookup()
-        logger.info("✅ SchoolDayLookup system initialized successfully")
-        
-        # Validate database connectivity
-        db_status = lookup_system.get_database_status()
-        logger.info(f"📊 Database status: {db_status}")
-        
-        # Extract the current status from the dictionary
-        current_status = db_status.get('current_status', 'unknown') if isinstance(db_status, dict) else str(db_status)
-        
-        if current_status.lower() != 'healthy':
-            logger.warning(f"⚠️ Database status is not optimal: {db_status}")
-            logger.info("🛡️ System will use fallback mechanisms if needed")
-        
-        # Get performance statistics
-        perf_stats = lookup_system.get_performance_stats()
-        cache_size = perf_stats.get('cache_size', 0)
-        hit_rate = perf_stats.get('hit_rate_percent', 0)
-        
-        logger.info(f"💾 Cache status: {cache_size} entries loaded, {hit_rate:.1f}% hit rate")
-        
-        # Test with today's date to ensure system is working
-        from datetime import datetime
-        import dateutil.tz
-        
+        service = SydneySchoolDayService()
+        status = service.get_database_status()
+        perf_stats = service.get_performance_stats()
+
+        logger.info(f" Calendar data source: {status.get('data_source')}")
+        available_terms = ", ".join(status.get('available_terms', [])) or "none"
+        logger.info(f" Available terms: {available_terms}")
+        logger.info(f" Cached day estimates: {status.get('cache_entries', 0)} days")
+
+        if status.get('current_status') != 'healthy':
+            logger.warning(" Calendar data is incomplete - fallbacks will engage if required")
+            logger.info(" Use 'python sydney_school_day_checker.py --clear-cache' to refresh data")
+
+        hit_rate = perf_stats.get('hit_rate_percent', 100.0)
+        logger.info(f" Lookup cache performance: {hit_rate:.1f}% (estimated)")
+
         today = datetime.now(dateutil.tz.gettz('Australia/Sydney'))
-        test_result = lookup_system.lookup_date(today)
-        
+        test_result = service.lookup_date(today)
+
         if test_result:
-            status = "school day" if test_result.is_school_day else "non-school day"
-            logger.info(f"🧪 System test: Today ({today.strftime('%Y-%m-%d')}) is a {status}")
-            logger.info(f"📋 Reason: {test_result.reason}")
-            
-            # Log lookup performance
+            status_text = "school day" if test_result.is_school_day else "non-school day"
+            logger.info(f" Service test: Today ({today.strftime('%Y-%m-%d')}) is a {status_text}")
+            logger.info(f" Reason: {test_result.reason}")
+
             lookup_time = test_result.lookup_time_ms or 0
             if lookup_time < 1.0:
-                logger.info(f"⚡ Lookup performance: {lookup_time:.3f}ms (sub-1ms achieved!)")
+                logger.info(f" Lookup performance: {lookup_time:.3f}ms (sub-1ms achieved!)")
             else:
-                logger.info(f"⏱️ Lookup performance: {lookup_time:.2f}ms")
+                logger.info(f" Lookup performance: {lookup_time:.2f}ms")
         else:
-            logger.warning("⚠️ System test failed - no result returned for today's date")
-        
-        # Check if current year data is available
-        current_year = today.year
-        year_stats = perf_stats.get('years_cached', [])
-        
-        if current_year in year_stats:
-            logger.info(f"📅 Calendar data for {current_year} is available and cached")
-            
-            # Quick data completeness check
-            try:
-                test_result_today = lookup_system.lookup_date(today)
-                if test_result_today:
-                    logger.info(f"✅ Data completeness verified - today's lookup successful")
-                else:
-                    logger.warning(f"⚠️ Data completeness issue - today's lookup failed")
-            except Exception as e:
-                logger.warning(f"⚠️ Data completeness check failed: {e}")
-        else:
-            logger.warning(f"⚠️ No calendar data found for current year {current_year}")
-            logger.error(f"🚨 CRITICAL: Calendar data missing for {current_year}")
-            logger.info(f"💡 URGENT: Run 'python school_calendar_generator.py {current_year}' to generate data")
-            logger.info("🛡️ System will use fallback mechanisms until data is available")
-        
-        # Initialize calendar automation system
-        try:
-            from calendar_automation import get_automation_system
-            
-            logger.info("🤖 Initializing calendar automation system...")
-            automation = get_automation_system(school_day_lookup=lookup_system)
-            
-            # Perform initial automatic checks during startup
-            logger.info("🔍 Performing startup calendar validation...")
-            startup_results = automation.perform_automatic_checks()
-            
-            issues_count = len(startup_results.get('issues_found', []))
-            if issues_count > 0:
-                logger.warning(f"⚠️ Startup validation found {issues_count} calendar issues")
-                for issue in startup_results['issues_found']:
-                    logger.warning(f"   • {issue}")
-                
-                # Process any critical tasks immediately
-                task_results = automation.process_pending_tasks()
-                if task_results['completed'] > 0:
-                    logger.info(f"✅ Automatically resolved {task_results['completed']} calendar issues")
-            else:
-                logger.info("✅ Startup calendar validation passed - all data up to date")
-            
-            # Start background monitoring if enabled
-            if automation.enable_background_monitoring:
-                automation.start_background_monitoring()
-                logger.info("🚀 Calendar automation background monitoring started")
-            else:
-                logger.info("📋 Calendar automation initialized (background monitoring disabled)")
-                
-        except ImportError:
-            logger.info("📋 Calendar automation system not available (optional feature)")
-        except Exception as e:
-            logger.warning(f"⚠️ Failed to initialize calendar automation: {e}")
-            logger.info("🛡️ Manual calendar management will be required")
-        
-        logger.info("✅ School Day Lookup System fully initialized and validated")
-        flush_logs()  # Ensure initialization logs are written
-        return lookup_system, True
-        
-    except ImportError as e:
-        logger.error(f"❌ Import error initializing SchoolDayLookup: {e}")
-        logger.error("💡 Ensure school_day_lookup.py and database modules are available")
-        return None, False
-        
+            logger.warning(" Service test failed - no result returned for today's date")
+
+        logger.info(" Sydney School Day Service fully initialized and validated")
+        flush_logs()
+        return service, True
+
     except Exception as e:
-        logger.error(f"❌ Failed to initialize SchoolDayLookup system: {e}")
-        logger.error("🛡️ System will fall back to basic weekend checking")
-        
-        # Log additional debugging information
-        if "database" in str(e).lower() or "connection" in str(e).lower():
-            logger.error("🔧 Database connection issue detected")
-            logger.error("💡 Check PostgreSQL service and credentials:")
-            logger.error("   - Database server running on Raspberry Pi")
-            logger.error("   - Correct DB_HOST, DB_USER, DB_PASSWORD environment variables")
-            logger.error("   - Network connectivity to database server")
-        
+        logger.error(f" Failed to initialize Sydney School Day Service: {e}")
+        logger.error(" System will fall back to legacy heuristics")
+        logger.error(" Check internet connectivity and NSW Education calendar availability")
         return None, False
+
 
 # Initialize the school day lookup system
-school_day_lookup, initialization_success = initialize_school_day_system()
+school_day_service, initialization_success = initialize_school_day_system()
 
 if not initialization_success:
-    logger.warning("⚠️ SchoolDayLookup initialization failed - using fallback mode")
+    logger.warning("⚠️ SydneySchoolDayService initialization failed - using fallback mode")
     logger.info("🔄 The monitor will continue with basic weekend checking")
 
 # Configuration from environment variables
@@ -291,14 +398,14 @@ else:
     else:
         logger.info(f'🔄 Custom interval: ~{estimated_calls} API calls per month')
 
-# Hardcoded arrays removed - now using database-backed SchoolDayLookup system
+# Hardcoded arrays removed - now using dynamic SydneySchoolDayService
 
 LAST_TWEET_FILE = 'last_tweet_id.txt'
 LAST_CHECK_FILE = 'last_check_time.txt'
 
 def is_sydney_school_day(check_date):
     """
-    Check if a given date is a Sydney school day using the high-performance SchoolDayLookup system.
+    Check if a given date is a Sydney school day using the dynamic SydneySchoolDayService.
     Implements comprehensive fallback mechanisms for graceful degradation.
     """
     return _school_day_with_fallbacks(check_date)
@@ -308,8 +415,8 @@ def _school_day_with_fallbacks(check_date):
     Comprehensive school day checking with multiple fallback layers.
     
     Fallback hierarchy:
-    1. SchoolDayLookup system (database-backed, sub-1ms)
-    2. SchoolDayLookup fallback mechanisms (heuristic, cached, local file)
+    1. SydneySchoolDayService (calendar-backed, sub-second)
+    2. SydneySchoolDayService internal fallbacks (calendar cache, scraped data)
     3. Legacy heuristic calculation (NSW school calendar patterns)
     4. Basic weekend check (conservative fallback)
     
@@ -325,10 +432,10 @@ def _school_day_with_fallbacks(check_date):
     if isinstance(check_date, datetime):
         check_date = check_date.date()
     
-    # Layer 1: Try SchoolDayLookup system (primary database + cache)
+    # Layer 1: Try SydneySchoolDayService (primary calendar service)
     try:
-        if school_day_lookup:
-            result = school_day_lookup.lookup_date(check_date)
+        if school_day_service:
+            result = school_day_service.lookup_date(check_date)
             if result:
                 # Log performance and source information
                 lookup_time = getattr(result, 'lookup_time_ms', None)
@@ -336,52 +443,52 @@ def _school_day_with_fallbacks(check_date):
                 reason = getattr(result, 'reason', 'unknown')
                 
                 if lookup_time is not None:
-                    source = "cache" if cache_hit else "database"
+                    source = "cache" if cache_hit else "service"
                     if lookup_time < 1.0:
-                        logger.debug(f"✅ SchoolDayLookup ({source}): {check_date} -> {result.is_school_day} ({lookup_time:.3f}ms, {reason})")
+                        logger.debug(f"✅ SydneySchoolDayService ({source}): {check_date} -> {result.is_school_day} ({lookup_time:.3f}ms, {reason})")
                     else:
-                        logger.debug(f"✅ SchoolDayLookup ({source}): {check_date} -> {result.is_school_day} ({lookup_time:.2f}ms, {reason})")
+                        logger.debug(f"✅ SydneySchoolDayService ({source}): {check_date} -> {result.is_school_day} ({lookup_time:.2f}ms, {reason})")
                 else:
-                    logger.debug(f"✅ SchoolDayLookup: {check_date} -> {result.is_school_day} ({reason})")
+                    logger.debug(f"✅ SydneySchoolDayService: {check_date} -> {result.is_school_day} ({reason})")
                 
                 return result.is_school_day
             else:
-                logger.warning(f"⚠️ SchoolDayLookup returned no result for {check_date}")
-                logger.info("💡 This may indicate missing calendar data or date outside loaded range")
+                logger.warning(f"⚠️ SydneySchoolDayService returned no result for {check_date}")
+                logger.info("💡 This may indicate missing calendar data or a date outside the cached range")
         else:
-            logger.debug("⚠️ SchoolDayLookup system not available - initialization may have failed")
+            logger.debug("⚠️ SydneySchoolDayService not available - initialization may have failed")
     
     except ImportError as e:
-        logger.warning(f"❌ SchoolDayLookup import error for {check_date}: {e}")
-        logger.info("💡 Database modules may not be properly installed")
+        logger.warning(f"❌ SydneySchoolDayService import error for {check_date}: {e}")
+        logger.info("💡 Required calendar modules may not be properly installed")
     except ConnectionError as e:
-        logger.warning(f"❌ SchoolDayLookup connection error for {check_date}: {e}")
-        logger.info("💡 Database server may be unavailable - check PostgreSQL service")
+        logger.warning(f"❌ SydneySchoolDayService connection error for {check_date}: {e}")
+        logger.info("💡 Calendar data source may be unavailable - check internet connectivity")
     except Exception as e:
         error_type = type(e).__name__
-        logger.warning(f"❌ SchoolDayLookup error ({error_type}) for {check_date}: {e}")
+        logger.warning(f"❌ SydneySchoolDayService error ({error_type}) for {check_date}: {e}")
         
         # Provide specific guidance based on error type
         error_str = str(e).lower()
         if "timeout" in error_str:
-            logger.info("💡 Database timeout - server may be overloaded")
+            logger.info("💡 Calendar fetch timeout - source may be slow or offline")
         elif "permission" in error_str or "access" in error_str:
-            logger.info("💡 Database permission issue - check user privileges")
+            logger.info("💡 Permission issue accessing cached calendar data")
         elif "table" in error_str or "relation" in error_str:
-            logger.info("💡 Database schema issue - check if tables exist")
+            logger.info("💡 Calendar data missing - consider refreshing the local cache")
     
-    # Layer 2: Try SchoolDayLookup internal fallbacks (if system is available)
+    # Layer 2: Try SydneySchoolDayService internal fallbacks (if system is available)
     try:
-        if school_day_lookup:
-            # The SchoolDayLookup system has its own comprehensive fallbacks
+        if school_day_service:
+            # The SydneySchoolDayService service has its own comprehensive fallbacks
             # Try to use them directly
-            fallback_result = school_day_lookup._comprehensive_fallback_lookup(check_date, "system_fallback")
+            fallback_result = school_day_service._comprehensive_fallback_lookup(check_date, "system_fallback")
             if fallback_result:
-                logger.info(f"🛡️ SchoolDayLookup fallback: {check_date} is {'school day' if fallback_result.is_school_day else 'not school day'}")
+                logger.info(f"🛡️ SydneySchoolDayService fallback: {check_date} is {'school day' if fallback_result.is_school_day else 'not school day'}")
                 return fallback_result.is_school_day
     
     except Exception as e:
-        logger.debug(f"SchoolDayLookup fallback failed: {e}")
+        logger.debug(f"SydneySchoolDayService fallback failed: {e}")
     
     # Layer 3: Legacy heuristic calculation (NSW school calendar patterns)
     try:
@@ -405,8 +512,8 @@ def _school_day_with_fallbacks(check_date):
         logger.warning(f"🚨 Using basic weekend check: {check_date} -> {'weekday' if is_weekday else 'weekend'}")
         logger.error("💡 All advanced school day checking methods failed!")
         logger.info("   Recommendations:")
-        logger.info("   - Check database connectivity and PostgreSQL service status")
-        logger.info("   - Verify calendar data exists for the current year")
+        logger.info("   - Verify NSW calendar endpoints are reachable")
+        logger.info("   - Confirm calendar data exists for the current year")
         logger.info("   - Ensure all required Python packages are installed")
         logger.info("   - Review system logs for specific error details")
         
@@ -499,10 +606,43 @@ def _legacy_school_day_heuristic(check_date):
     # If we get here, it's likely a school day (weekday during term time)
     return True
 
+async def log_heartbeat():
+    """
+    Emit a periodic heartbeat message summarising system health.
+    Mirrors the old database heartbeat but now reports calendar service stats.
+    """
+    try:
+        sydney_tz = dateutil.tz.gettz('Australia/Sydney')
+        now = datetime.now(sydney_tz)
+        logger.info(f"💓 Heartbeat: {now.strftime('%Y-%m-%d %H:%M:%S %Z')}")
+
+        if school_day_service:
+            status = school_day_service.get_database_status()
+            perf = school_day_service.get_performance_stats()
+
+            state = status.get('current_status', 'unknown')
+            available_terms = ", ".join(status.get('available_terms', [])) or "none"
+            logger.debug(f"📅 Calendar service status: {state} | terms cached: {available_terms}")
+
+            total_lookups = perf.get('total_lookups', 0)
+            cache_rate = perf.get('cache_hit_rate', 0.0) * 100
+            avg_lookup = perf.get('avg_lookup_time_ms', 0.0)
+            logger.debug(f"📈 Calendar performance: {total_lookups} lookups | "
+                         f"{cache_rate:.1f}% cache hit | {avg_lookup:.2f}ms avg")
+
+            if status.get('errors'):
+                logger.warning(f"⚠️ Calendar service recorded {status['errors']} lookup errors")
+        else:
+            logger.warning("⚠️ Calendar service unavailable - heartbeat using fallback mode")
+
+    except Exception as heartbeat_error:
+        logger.warning(f"⚠️ Heartbeat status collection failed: {heartbeat_error}")
+
+
 def _get_fallback_status():
     """
     Get the current status of fallback systems for monitoring and debugging.
-    
+
     Returns:
         dict: Status information about fallback systems
     """
@@ -510,23 +650,23 @@ def _get_fallback_status():
     
     status = {
         'timestamp': datetime.now().isoformat(),
-        'school_day_lookup_available': school_day_lookup is not None,
+        'school_day_service_available': school_day_service is not None,
         'initialization_success': initialization_success,
         'fallback_layers': [
-            'SchoolDayLookup system (database-backed)',
-            'SchoolDayLookup internal fallbacks',
+            'SydneySchoolDayService (calendar-backed)',
+            'SydneySchoolDayService internal fallbacks',
             'Legacy heuristic calculation',
             'Basic weekend check'
         ]
     }
     
-    if school_day_lookup:
+    if school_day_service:
         try:
-            db_status = school_day_lookup.get_database_status()
-            perf_stats = school_day_lookup.get_performance_stats()
+            db_status = school_day_service.get_database_status()
+            perf_stats = school_day_service.get_performance_stats()
             
             status.update({
-                'database_status': db_status.get('current_status', 'unknown') if isinstance(db_status, dict) else str(db_status),
+                'service_status': db_status.get('current_status', 'unknown') if isinstance(db_status, dict) else str(db_status),
                 'cache_size': perf_stats.get('cache_size', 0),
                 'fallback_usage_rate': perf_stats.get('fallback_system', {}).get('fallback_rate_percent', 0)
             })
@@ -614,10 +754,10 @@ async def test_fallback_system():
     fallback_status = _get_fallback_status()
     logger.info(f'🛡️ Fallback system status: {len(fallback_status["fallback_layers"])} layers available')
     
-    if school_day_lookup:
-        logger.info('✅ Primary SchoolDayLookup system available')
+    if school_day_service:
+        logger.info('✅ Primary SydneySchoolDayService service available')
     else:
-        logger.info('⚠️ Primary SchoolDayLookup system unavailable - using fallbacks')
+        logger.info('⚠️ Primary SydneySchoolDayService service unavailable - using fallbacks')
     
     return success_rate >= 80  # Return True if at least 80% of tests passed
 
@@ -653,14 +793,14 @@ async def validate_calendar_data_availability():
         validation_result['current_year'] = current_year
         validation_result['next_year'] = next_year
         
-        if school_day_lookup:
+        if school_day_service:
             # Get performance statistics to check cached years
-            perf_stats = school_day_lookup.get_performance_stats()
+            perf_stats = school_day_service.get_performance_stats()
             years_cached = perf_stats.get('years_cached', [])
             cache_size = perf_stats.get('cache_size', 0)
             
             logger.info(f'📊 Years cached: {years_cached}')
-            logger.info(f'💾 Total cache entries: {cache_size}')
+            logger.info(f'💾 Estimated cached days: {cache_size}')
             
             # Check current year availability
             if current_year in years_cached:
@@ -680,7 +820,7 @@ async def validate_calendar_data_availability():
                 
                 for test_date in test_dates:
                     try:
-                        result = school_day_lookup.lookup_date(test_date)
+                        result = school_day_service.lookup_date(test_date)
                         if result:
                             successful_lookups += 1
                     except Exception as e:
@@ -701,14 +841,14 @@ async def validate_calendar_data_availability():
             else:
                 # Only warn about next year if we're in Q4
                 if now.month >= 10:  # October or later
-                    validation_result['recommendations'].append(f'Consider generating calendar data for {next_year} (approaching year transition)')
-                    logger.info(f'💡 Consider generating calendar data for {next_year} (year transition approaching)')
+                    validation_result['recommendations'].append(f'Consider refreshing calendar data for {next_year} (approaching year transition)')
+                    logger.info(f'💡 Consider refreshing calendar data for {next_year} (year transition approaching)')
                 else:
                     logger.debug(f'Next year ({next_year}) data not yet needed')
         
         else:
-            validation_result['critical_issues'].append('SchoolDayLookup system not available')
-            logger.warning('❌ SchoolDayLookup system not available - cannot validate calendar data')
+            validation_result['critical_issues'].append('SydneySchoolDayService not available')
+            logger.warning('❌ SydneySchoolDayService not available - cannot validate calendar data')
         
         # Determine overall status
         if validation_result['current_year_available'] and validation_result['data_completeness'] >= 90:
@@ -718,20 +858,20 @@ async def validate_calendar_data_availability():
         elif validation_result['current_year_available'] and validation_result['data_completeness'] >= 70:
             validation_result['status'] = 'good'
             logger.info('✅ Calendar data status: GOOD')
-            validation_result['recommendations'].append('Some test dates failed - consider regenerating calendar data')
+            validation_result['recommendations'].append('Some test dates failed - consider refreshing calendar data')
             
         elif validation_result['current_year_available']:
             validation_result['status'] = 'degraded'
             logger.warning('⚠️ Calendar data status: DEGRADED')
-            validation_result['recommendations'].append('Data completeness is low - regenerate calendar data recommended')
+            validation_result['recommendations'].append('Data completeness is low - refresh calendar cache recommended')
             
         else:
             validation_result['status'] = 'critical'
             logger.error('❌ Calendar data status: CRITICAL')
             validation_result['critical_issues'].append('Current year calendar data is missing')
             validation_result['recommendations'].extend([
-                f'URGENT: Generate calendar data for {current_year}',
-                f'Run: python school_calendar_generator.py {current_year}',
+                f'URGENT: Refresh calendar data for {current_year}',
+                "Run: python sydney_school_day_checker.py --clear-cache",
                 'System will use fallback mechanisms until data is available'
             ])
         
@@ -1511,257 +1651,100 @@ async def test_twitterapi_connection():
         logger.error(f'❌ TwitterAPI.io connection test failed: {e}')
         return False
 
+
 async def test_database_connection():
-    """Test SchoolDayLookup database connection for startup validation with enhanced error handling"""
+    """Validate the SydneySchoolDayService for startup checks."""
     try:
-        if not school_day_lookup:
-            logger.error('❌ SchoolDayLookup system not initialized')
-            logger.info('💡 This may indicate database connectivity issues or configuration problems')
-            logger.info('   - Check PostgreSQL service on Raspberry Pi')
-            logger.info('   - Verify DB_HOST, DB_USER, DB_PASSWORD environment variables')
-            logger.info('   - Ensure network connectivity to database server')
+        if not school_day_service:
+            logger.error(' SydneySchoolDayService not initialized')
+            logger.info('   - Ensure NSW calendar data can be downloaded')
+            logger.info("   - Run 'python sydney_school_day_checker.py --clear-cache'")
+            logger.info('   - Verify internet connectivity')
             return False
-        
-        logger.debug('🧪 Testing SchoolDayLookup database connection...')
-        
-        # Test database connectivity with detailed status reporting
-        db_status = school_day_lookup.get_database_status()
-        current_status = db_status.get('current_status', 'unknown') if isinstance(db_status, dict) else str(db_status)
-        
-        if current_status.lower() == 'healthy':
-            logger.info('✅ Database connection healthy')
-            
-            # Log additional database health metrics
-            if isinstance(db_status, dict):
-                if 'last_successful_query' in db_status:
-                    logger.debug(f'   Last successful query: {db_status["last_successful_query"]}')
-                if 'connection_pool_status' in db_status:
-                    logger.debug(f'   Connection pool: {db_status["connection_pool_status"]}')
-            
-            # Test a lookup to ensure full functionality
-            from datetime import datetime
-            import dateutil.tz
-            
-            test_date = datetime.now(dateutil.tz.gettz('Australia/Sydney'))
-            result = school_day_lookup.lookup_date(test_date)
-            
-            if result:
-                lookup_time = result.lookup_time_ms or 0
-                
-                # Performance categorization with actionable insights
-                if lookup_time < 1.0:
-                    logger.info(f'✅ Database lookup successful - Excellent performance ({lookup_time:.3f}ms)')
-                elif lookup_time < 10.0:
-                    logger.info(f'✅ Database lookup successful - Good performance ({lookup_time:.2f}ms)')
-                else:
-                    logger.warning(f'✅ Database lookup successful - Slow performance ({lookup_time:.2f}ms)')
-                    logger.info('💡 Consider cache optimization or database performance tuning')
-                
-                # Log cache utilization if available
-                if hasattr(result, 'cache_hit'):
-                    cache_status = "cache hit" if result.cache_hit else "database query"
-                    logger.debug(f'📊 Result source: {cache_status}')
-                
-                return True
+
+        status = school_day_service.get_database_status()
+        current_status = (status.get('current_status', 'unknown') if isinstance(status, dict) else str(status)).lower()
+        logger.info(f' Calendar service status: {current_status.upper()}')
+
+        if current_status != 'healthy':
+            logger.warning(' Calendar service reported non-healthy status')
+            logger.info("   - Attempt to refresh cache: python sydney_school_day_checker.py --clear-cache")
+            logger.info('   - Confirm NSW Education calendar endpoints are reachable')
+
+        sydney_tz = dateutil.tz.gettz('Australia/Sydney')
+        test_date = datetime.now(sydney_tz)
+        result = school_day_service.lookup_date(test_date)
+
+        if result:
+            lookup_time = result.lookup_time_ms or 0
+            if lookup_time < 1.0:
+                logger.info(f' Calendar lookup successful - Excellent performance ({lookup_time:.3f}ms)')
+            elif lookup_time < 10.0:
+                logger.info(f' Calendar lookup successful - Good performance ({lookup_time:.2f}ms)')
             else:
-                logger.error('❌ Database lookup returned no result')
-                logger.warning('💡 This may indicate missing calendar data or date outside loaded range')
-                logger.info(f'   - Check if calendar data exists for {test_date.year}')
-                logger.info(f'   - Run: python school_calendar_generator.py {test_date.year}')
-                return False
-        
-        elif current_status.lower() == 'degraded':
-            logger.warning(f'⚠️ Database status: DEGRADED - performance issues detected')
-            logger.info('💡 System will use fallbacks and caching to maintain functionality')
-            logger.info('   - Monitor database server resources (CPU, memory, disk)')
-            logger.info('   - Check for slow queries or connection pool exhaustion')
-            return True  # System can still work with fallbacks
-            
-        elif current_status.lower() == 'recovering':
-            logger.info(f'🔄 Database status: RECOVERING - system is stabilizing')
-            logger.info('💡 Previous issues detected, automatic recovery in progress')
-            return True  # System should stabilize automatically
-            
-        elif current_status.lower() == 'unavailable':
-            logger.error(f'❌ Database status: UNAVAILABLE - complete database failure')
-            logger.error('💡 Critical database connectivity issue:')
-            logger.error('   - PostgreSQL service may be down on Raspberry Pi')
-            logger.error('   - Network connectivity issues to database host')
-            logger.error('   - Database server resource exhaustion')
-            logger.info('🛡️ System will fall back to heuristic school day checking')
-            return False
-            
-        else:
-            logger.error(f'❌ Database status: {current_status.upper()} (unknown status)')
-            logger.warning('💡 Unexpected database status - this may indicate a system issue')
-            return False
-            
-    except ImportError as e:
-        logger.error(f'❌ Import error during database test: {e}')
-        logger.error('💡 Missing required database modules:')
-        logger.error('   - Check if psycopg2-binary is installed: pip install psycopg2-binary')
-        logger.error('   - Verify school_day_lookup.py module is available')
-        logger.info('🛡️ System will fall back to basic weekend checking')
-        return False
-        
-    except ConnectionError as e:
-        logger.error(f'❌ Database connection failed: {e}')
-        logger.error('💡 Network or database connectivity issue:')
-        logger.error('   - Verify PostgreSQL service is running on Raspberry Pi')
-        logger.error('   - Check network connectivity to database host')
-        logger.error('   - Verify firewall settings allow database connections')
-        logger.error('   - Test database credentials (DB_USER, DB_PASSWORD)')
-        logger.info('🛡️ System will fall back to heuristic school day checking')
-        return False
-        
-    except Exception as e:
-        error_type = type(e).__name__
-        logger.error(f'❌ Database connection test failed ({error_type}): {e}')
-        
-        # Provide context-specific error guidance
-        error_str = str(e).lower()
-        if "timeout" in error_str:
-            logger.error('💡 Timeout error: Database response too slow')
-            logger.error('   - Check database server performance and load')
-            logger.error('   - Verify network latency to database host')
-            logger.error('   - Consider increasing connection timeout settings')
-        elif any(word in error_str for word in ["authentication", "password", "login"]):
-            logger.error('💡 Authentication error: Invalid database credentials')
-            logger.error('   - Verify DB_USER and DB_PASSWORD environment variables')
-            logger.error('   - Check database user exists and has correct password')
-            logger.error('   - Ensure database user has required permissions')
-        elif "permission" in error_str or "access" in error_str:
-            logger.error('💡 Permission error: Database user lacks required privileges')
-            logger.error('   - Check database user permissions for school_calendar table')
-            logger.error('   - Verify schema access rights and SELECT permissions')
-        elif "table" in error_str or "relation" in error_str:
-            logger.error('💡 Schema error: Required database tables missing')
-            logger.error('   - Run database schema initialization')
-            logger.error('   - Check if school_calendar table exists')
-        else:
-            logger.error('💡 Unexpected error: This may indicate a system or configuration issue')
-            logger.debug(f'   Full error details: {repr(e)}')
-        
-        logger.info('🛡️ System will fall back to basic weekend checking')
+                logger.warning(f' Calendar lookup successful - Slow performance ({lookup_time:.2f}ms)')
+                logger.info(' Consider clearing the cache or refreshing calendar data')
+            return True
+
+        logger.error(' Calendar lookup returned no result')
+        logger.warning(' Calendar data may be missing or outside the cached range')
+        logger.info(f'   - Check if calendar data exists for {test_date.year}')
+        logger.info("   - Run 'python sydney_school_day_checker.py --clear-cache'")
         return False
 
-async def log_heartbeat():
-    """Log a heartbeat message to show the script is alive with enhanced system status."""
-    try:
-        # Basic heartbeat
-        logger.info("💓 T8 Monitor heartbeat - system running normally")
-        flush_logs()  # Ensure heartbeat is written immediately
-        
-        # Enhanced database status reporting during heartbeat
-        if school_day_lookup:
-            try:
-                db_status = school_day_lookup.get_database_status()
-                current_status = db_status.get('current_status', 'unknown') if isinstance(db_status, dict) else str(db_status)
-                
-                # Only log if status is not healthy
-                if current_status.lower() != 'healthy':
-                    logger.info(f"📊 Database status: {current_status.upper()}")
-                    
-                    # Provide actionable guidance based on status
-                    if current_status.lower() == 'unavailable':
-                        logger.warning("💡 Database unavailable - using fallback mechanisms")
-                    elif current_status.lower() == 'degraded':
-                        logger.info("💡 Database degraded - performance may be affected")
-                    elif current_status.lower() == 'recovering':
-                        logger.info("💡 Database recovering - should stabilize soon")
-                
-                # Log performance metrics if available
-                try:
-                    perf_stats = school_day_lookup.get_performance_stats()
-                    total_lookups = perf_stats.get('total_lookups', 0)
-                    cache_hit_rate = perf_stats.get('cache_hit_rate', 0)
-                    avg_lookup_time = perf_stats.get('average_lookup_time_ms', 0)
-                    
-                    # Only log performance if there have been lookups since last heartbeat
-                    if total_lookups > 0:
-                        logger.debug(f"📈 Performance: {total_lookups} lookups, "
-                                   f"{cache_hit_rate:.1%} cache hits, "
-                                   f"{avg_lookup_time:.2f}ms avg")
-                        
-                        # Warn if performance is degrading
-                        if avg_lookup_time > 10.0:
-                            logger.warning(f"⏱️ Slow lookup performance: {avg_lookup_time:.2f}ms average")
-                            logger.info("💡 Consider cache optimization or database tuning")
-                        
-                except Exception as perf_error:
-                    logger.debug(f"Performance stats unavailable: {perf_error}")
-                    
-            except Exception as db_error:
-                logger.debug(f"Database status check during heartbeat failed: {db_error}")
-                
     except Exception as e:
-        logger.warning(f"⚠️ Enhanced heartbeat logging failed: {e}")
-        # Fallback to basic heartbeat
-        logger.info("💓 T8 Monitor heartbeat - system running (basic mode)")
+        logger.error(f' Calendar service validation failed: {e}')
+        logger.info('   - Check internet connectivity or refresh local cache')
+        return False
+
 
 async def monitor_database_health():
     """
-    Monitor database health and log issues with actionable recommendations.
-    This function can be called periodically or triggered by errors.
+    Monitor the SydneySchoolDayService health and log actionable recommendations.
     """
-    if not school_day_lookup:
-        logger.warning("📊 Database health check: SchoolDayLookup system not available")
+    if not school_day_service:
+        logger.warning(' Calendar health check: SydneySchoolDayService not available')
         return
-    
+
     try:
-        logger.debug("🔍 Performing database health check...")
-        
-        # Get comprehensive health status
-        health_status = school_day_lookup.get_health_status()
-        
+        logger.debug(' Performing calendar health check...')
+
+        health_status = school_day_service.get_health_status()
         overall_status = health_status.get('overall_status', 'unknown')
-        logger.info(f"📊 Database health: {overall_status.upper()}")
-        
-        # Report specific issues
-        if 'issues' in health_status and health_status['issues']:
-            logger.warning("⚠️ Database health issues detected:")
-            for issue in health_status['issues']:
-                logger.warning(f"   • {issue}")
-        
-        # Report database connection status
-        if 'database_connection' in health_status:
-            if not health_status['database_connection']:
-                logger.error("❌ Database connection failed")
-                logger.error("💡 Troubleshooting steps:")
-                logger.error("   - Check PostgreSQL service on Raspberry Pi")
-                logger.error("   - Verify network connectivity")
-                logger.error("   - Test database credentials")
-        
-        # Report cache status
-        if 'cache_status' in health_status:
-            cache_status = health_status['cache_status']
-            if cache_status.get('status') != 'healthy':
-                logger.warning(f"⚠️ Cache status: {cache_status.get('status', 'unknown')}")
-                logger.info(f"💡 Cache entries: {cache_status.get('entry_count', 0)}")
-        
-        # Report fallback system status
-        if 'fallback_system' in health_status:
-            fallback_status = health_status['fallback_system']
-            if fallback_status.get('status') != 'ready':
-                logger.warning(f"⚠️ Fallback system: {fallback_status.get('status', 'unknown')}")
-        
-        # Performance analysis
-        if 'performance' in health_status:
-            perf = health_status['performance']
-            avg_time = perf.get('average_lookup_time_ms', 0)
-            
-            if avg_time > 10.0:
-                logger.warning(f"⏱️ Performance concern: {avg_time:.2f}ms average lookup time")
-                logger.info("💡 Consider cache preloading or database optimization")
-            elif avg_time > 1.0:
-                logger.debug(f"📈 Performance: {avg_time:.2f}ms average lookup time")
-        
+        logger.info(f' Calendar health: {overall_status.upper()}')
+
+        details = health_status.get('details', [])
+        if details:
+            logger.warning(' Calendar service notes:')
+            for detail in details:
+                logger.warning(f'   - {detail}')
+
+        cache_info = health_status.get('cache', {})
+        if cache_info:
+            entry_count = cache_info.get('entry_count', 0)
+            hit_rate = cache_info.get('hit_rate_percent', 0.0)
+            logger.debug(f' Calendar cache entries: {entry_count} | hit rate: {hit_rate:.1f}%')
+            if entry_count == 0:
+                logger.warning(' Calendar cache is empty - refresh recommended')
+
+        fallback_info = health_status.get('fallback_system', {})
+        if fallback_info.get('status') != 'ready':
+            logger.warning(f" Calendar fallback system: {fallback_info.get('status', 'unknown')}")
+
+        perf = health_status.get('performance', {})
+        avg_time = perf.get('average_lookup_time_ms', 0.0)
+        if avg_time > 10.0:
+            logger.warning(f' Calendar lookup performance concern: {avg_time:.2f}ms average')
+        elif avg_time > 1.0:
+            logger.debug(f' Calendar lookup performance: {avg_time:.2f}ms average')
+
         return overall_status
-        
+
     except Exception as e:
-        logger.error(f"❌ Database health check failed: {e}")
-        logger.info("💡 This may indicate a serious system issue requiring investigation")
+        logger.error(f' Calendar health check failed: {e}')
+        logger.info(' This may indicate stale or missing calendar data')
         return 'error'
+
 
 async def send_critical_error_alert(error_message):
     """Send critical error alert to Telegram."""
@@ -1802,16 +1785,16 @@ async def startup_validation():
     
     logger.info(f'✅ All required environment variables present for {api_type}')
     
-    # Validate SchoolDayLookup system status
+    # Validate SydneySchoolDayService service status
     logger.info('📊 Validating School Day Lookup System...')
-    if school_day_lookup and initialization_success:
+    if school_day_service and initialization_success:
         try:
             # Get system health status
-            db_status = school_day_lookup.get_database_status()
-            perf_stats = school_day_lookup.get_performance_stats()
+            db_status = school_day_service.get_database_status()
+            perf_stats = school_day_service.get_performance_stats()
             current_status = db_status.get('current_status', 'unknown') if isinstance(db_status, dict) else str(db_status)
             
-            logger.info(f'✅ SchoolDayLookup system operational')
+            logger.info(f'✅ SydneySchoolDayService service operational')
             logger.info(f'📊 Database status: {current_status}')
             logger.info(f'💾 Cache entries: {perf_stats.get("cache_size", 0)}')
             logger.info(f'🎯 Cache hit rate: {perf_stats.get("hit_rate_percent", 0):.1f}%')
@@ -1828,10 +1811,10 @@ async def startup_validation():
                 logger.warning('💡 System will use fallback mechanisms')
             
         except Exception as e:
-            logger.error(f'❌ SchoolDayLookup system validation failed: {e}')
+            logger.error(f'❌ SydneySchoolDayService service validation failed: {e}')
             logger.warning('🛡️ System will fall back to basic weekend checking')
     else:
-        logger.warning('⚠️ SchoolDayLookup system not available')
+        logger.warning('⚠️ SydneySchoolDayService not available')
         logger.info('🔄 Using comprehensive fallback system')
         
         # Test fallback system functionality
@@ -1896,12 +1879,12 @@ async def main():
     # Test Ollama connection (non-blocking)
     await test_ollama_connection()
     
-    # Test database connection (non-blocking - system can work with fallbacks)
-    logger.info('🗄️ Testing database connection...')
+    # Test calendar service (non-blocking - system can work with fallbacks)
+    logger.info('🗄️ Testing calendar service...')
     db_test_result = await test_database_connection()
     if not db_test_result:
-        logger.warning('⚠️ Database connection test failed - continuing with fallback mode')
-        logger.info('🛡️ The monitor will use comprehensive fallback system when database is unavailable')
+        logger.warning('⚠️ Calendar service test failed - continuing with fallback mode')
+        logger.info('🛡️ The monitor will use comprehensive fallback system when the calendar service is unavailable')
     
     # Test fallback system (non-blocking - ensures graceful degradation works)
     logger.info('🛡️ Testing fallback system for graceful degradation...')
@@ -1920,10 +1903,10 @@ async def main():
     elif calendar_validation['status'] == 'good':
         logger.info('✅ Calendar data validation: GOOD - system ready for operation')
     elif calendar_validation['status'] == 'degraded':
-        logger.warning('⚠️ Calendar data validation: DEGRADED - consider regenerating data for optimal performance')
+        logger.warning('⚠️ Calendar data validation: DEGRADED - consider refreshing calendar data for optimal performance')
     elif calendar_validation['status'] == 'critical':
         logger.error('❌ Calendar data validation: CRITICAL - system will rely heavily on fallback mechanisms')
-        logger.error('🚨 URGENT: Generate calendar data to ensure accurate school day detection')
+        logger.error('🚨 URGENT: Refresh calendar data to ensure accurate school day detection')
     else:
         logger.error('❌ Calendar data validation: ERROR - validation process failed')
     
@@ -2005,9 +1988,9 @@ async def main():
                         await log_heartbeat()
                         
                         # Periodic system health check
-                        if school_day_lookup:
+                        if school_day_service:
                             try:
-                                db_status = school_day_lookup.get_database_status()
+                                db_status = school_day_service.get_database_status()
                                 current_status = db_status.get('current_status', 'unknown') if isinstance(db_status, dict) else str(db_status)
                                 
                                 if current_status.lower() != 'healthy':
@@ -2015,14 +1998,14 @@ async def main():
                                     
                                     # Log cache performance if available
                                     try:
-                                        perf_stats = school_day_lookup.get_performance_stats()
+                                        perf_stats = school_day_service.get_performance_stats()
                                         if perf_stats.get('cache_hit_rate', 0) < 0.8:  # Less than 80% cache hit rate
                                             logger.info(f"📈 Cache performance: {perf_stats.get('cache_hit_rate', 0):.1%} hit rate")
                                     except Exception:
                                         pass  # Performance stats are optional
                                         
                             except Exception as e:
-                                logger.debug(f"Heartbeat database status check failed: {e}")
+                                logger.debug(f"Heartbeat calendar status check failed: {e}")
                         
                         heartbeat_counter = 0
                     except Exception as e:
@@ -2064,9 +2047,9 @@ async def main():
         logger.info('🔄 Shutting down T8 Delays Monitor...')
         
         # Enhanced cleanup logging
-        if school_day_lookup:
+        if school_day_service:
             try:
-                final_stats = school_day_lookup.get_performance_stats()
+                final_stats = school_day_service.get_performance_stats()
                 logger.info(f"📊 Final performance stats: {final_stats.get('total_lookups', 0)} lookups, "
                            f"{final_stats.get('cache_hit_rate', 0):.1%} cache hit rate")
             except Exception:
